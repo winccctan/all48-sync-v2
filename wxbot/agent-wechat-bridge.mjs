@@ -181,9 +181,15 @@ function cmdOf(raw) {
     .replace(/[\uFF01-\uFF5E]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xFEE0))  // 全角→半角
     .replace(/[\u2005\u00a0]/g, ' ')
     .trim();
+  // 官方贡献榜（鸡腿）：gf?名字 / 榜?名字 / lg?名字 榜
+  // 🔴 必须排在 lg 规则之前，否则 `lg?蒋夏羽 榜` 会被当成普通 lg 转给云端
+  let m = /^(?:gf|榜|金主|贡献榜|官方榜)\s*[?？:：,，.。、!！]?\s*([\s\S]*)$/i.exec(s);
+  if (m) return { kind: 'gf', name: String(m[1] || '').trim().slice(0, 60) || ' ' };
+  m = /^(?:lg|鸡腿)\s*[?？:：,，.。、!！]?\s*([\s\S]*?)\s*(?:榜单|榜|官方榜|官方|贡献榜|贡献|金主)$/i.exec(s);
+  if (m) return { kind: 'gf', name: String(m[1] || '').trim().slice(0, 60) };
   // rb 只查成员/队伍，用问号或空格都行
-  let m = /^rb\s*[?？:：,，.。、!！]?\s*([\s\S]*)$/i.exec(s);
-  if (m) return { kind: 'rb', name: String(m[1] || '').trim().slice(0, 60) || ' ' };
+  let m2 = /^rb\s*[?？:：,，.。、!！]?\s*([\s\S]*)$/i.exec(s);
+  if (m2) return { kind: 'rb', name: String(m2[1] || '').trim().slice(0, 60) || ' ' };
   // 年度之星（MVP）：mvp?名字 / mvp?top20 / mvp?TEAM G，中文「年度之星?」也认
   m = /^(?:mvp|年度之星)\s*[?？:：,，.。、!！]?\s*([\s\S]*)$/i.exec(s);
   if (m) return { kind: 'mvp', name: String(m[1] || '').trim().slice(0, 40) || ' ' };
@@ -202,12 +208,91 @@ function cmdOf(raw) {
   return null;
 }
 
+/* ---------------- 官方贡献榜（口袋口径鸡腿） ----------------
+ * `gf?名字` / `榜?名字` / `lg?名字 榜`
+ *   POST pocketapi.48.cn/gift/api/v1/melee/rank/getPersonMeleeRankPage {resId: 成员uid}
+ * 🔴 为什么在桥里算：云端 worker 出口打 pocketapi 一律 403（换头/换版本号都没用，纯 IP），
+ *    这台机器实测 200 ⇒ 榜只能在这儿算。名字→uid 和 token 还是从 worker 取（/api/pocket/ctx）。
+ * 🔴 官方只公示前 16 名，没有分页也没有总数：page/limit/next/rankId/type/weekId/liveId 全试过，一样。
+ * 🔴 官方这份榜的统计口径（时间窗、算哪些礼物）我们从外部推不出来：各种窗口/单位都试过，
+ *    比值每人都不一样（0.14 ~ 172 倍），还有人在官方榜里但我们的库里完全没有 ⇒ **只原样展示，不复算、不换算**。
+ */
+const POCKET_APPINFO = JSON.stringify({
+  vendor: 'apple', deviceId: '12DAF282-90D5-4E5C-B000-5DD64FC79931',
+  appVersion: '7.1.48', appBuild: '26102601', osVersion: '18.6.0',
+  osType: 'ios', deviceName: 'iPad (7th generation)', os: 'ios',
+});
+const POCKET_UA = 'PocketFans201807/7.1.48 (iPad; iOS 18.6; Scale/2.00)';
+const GF_SEP = (v) => String(Number(v) || 0).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+const GF_CACHE = new Map();          // uid → { at, txt }
+const GF_TTL = 5 * 60 * 1000;
+
+async function gfCard(name) {
+  const nm = String(name || '').trim();
+  if (!nm || nm === ' ') {
+    return '用法：\ngf?名字（如 gf?蒋夏羽）　或　lg?蒋夏羽 榜\n'
+      + '· 口袋官方口径的鸡腿榜\n'
+      + '· 官方只公示前 16 名（没有第 17 名，也翻不了页）';
+  }
+  const u = new URL(WORKER + '/api/pocket/ctx');
+  u.searchParams.set('k', KEY);
+  u.searchParams.set('q', nm);
+  const d = await (await fetch(u, { signal: AbortSignal.timeout(15000) })).json().catch(() => null);
+  if (!d || !d.ok) {
+    if (d && Array.isArray(d.names) && d.names.length) return (d.msg || '匹配到多位') + '：' + d.names.join('、');
+    return (d && d.msg) ? d.msg : ('没找到「' + nm + '」');
+  }
+  if (!d.uid) return '名册里没有「' + nm + '」的口袋 ID';
+  if (!d.token) return '【' + d.n + '·官方榜】云端没配口袋 token，取不到';
+  const ck = String(d.uid);
+  const cached = GF_CACHE.get(ck);
+  if (cached && Date.now() - cached.at < GF_TTL) return cached.txt;
+  let j = null;
+  try {
+    const r = await fetch('https://pocketapi.48.cn/gift/api/v1/melee/rank/getPersonMeleeRankPage', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json;charset=utf-8',
+        appInfo: POCKET_APPINFO, token: d.token, pa: 'POCKET48', 'user-agent': POCKET_UA,
+      },
+      body: JSON.stringify({ resId: Number(d.uid) }),
+      signal: AbortSignal.timeout(20000),
+    });
+    j = await r.json().catch(() => null);
+    if (!j) return '【' + d.n + '·官方榜】口袋返回 HTTP ' + r.status;
+  } catch (e) {
+    return '【' + d.n + '·官方榜】连不进口袋：' + String((e && e.message) || e).slice(0, 50);
+  }
+  const list = ((j && j.content && j.content.charmInfo) || [])
+    .map((x) => ({
+      r: Number(x.rankNum) || 0,
+      n: String((x.userInfo && x.userInfo.nickname) || '匿名').slice(0, 30),
+      v: Number(x.totalCharm) || 0,
+    }))
+    .filter((x) => x.r)
+    .sort((a, b) => a.r - b.r);
+  if (!list.length) return '【' + d.n + '·官方榜】这个人的官方榜是空的（还没有人送过）';
+  const sum = list.reduce((a, x) => a + x.v, 0);
+  const lines = [
+    '【' + d.n + '·官方贡献榜】' + (d.tm || '') + (d.g ? ' / ' + d.g : ''),
+    '口袋官方口径 · 只公示前 16 名',
+    '— 鸡腿 —',
+  ];
+  for (const x of list) lines.push(x.r + '. ' + x.n + ' ' + GF_SEP(x.v));
+  lines.push('—— 前 ' + list.length + ' 名合计 ' + GF_SEP(sum));
+  lines.push('注：自家 lg?/zb? 只覆盖房间 + 直播，数字会比官方小；对外报数以本榜为准');
+  const txt = lines.join('\n');
+  if (GF_CACHE.size > 300) GF_CACHE.clear();
+  GF_CACHE.set(ck, { at: Date.now(), txt });
+  return txt;
+}
+
 /* ---------------- 云端指令前缀表（2026-11-12） ----------------
    桥不再硬编码「哪些词算指令」：启动后每 10 分钟从 worker 拉一次 KV `wxcmd:spec`。
    ⇒ 以后加指令：worker 里写解析 + KV 里加个前缀，**那台机器完全不用碰**。
    🔴 拉不到就用内置默认（和以前的硬编码完全一致），行为不会退化。 */
 const SPEC_FILE = `${XDG}/state/wxspec.json`;
-const SPEC_DEFAULT = ['lg', '鸡腿', 'rb', 'mvp', '年度之星'];
+const SPEC_DEFAULT = ['lg', '鸡腿', 'rb', 'mvp', '年度之星', 'gf', '榜', '金主'];
 const SPEC_TTL = 3 * 60 * 1000;
 /* usage：前缀 → 用法文案，全部云端下发（2026-11-13「gy 查询指令」被当成人名去查名册）。
    桥只负责「把云端那段贴出来」，文案一个字都不硬编码。 */
@@ -1782,6 +1867,15 @@ async function handle(ev) {
     } catch (e) {
       log('AI 失败：' + (e && e.message));
     }
+    return;
+  }
+
+  /* 官方贡献榜（鸡腿）：云端打不通口袋，在本机取（见 gfCard） */
+  if (c.kind === 'gf') {
+    let txt = '';
+    try { txt = await gfCard(c.name); }
+    catch (e) { txt = '官方榜没取到：' + String((e && e.message) || e).slice(0, 60); }
+    if (txt) await say(chat, txt, 'gf:' + String(c.name || '').slice(0, 20));
     return;
   }
 
