@@ -97,3 +97,18 @@ jobs:
           INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
           POCKET48_TOKEN: ${{ secrets.POCKET48_TOKEN }}
           SCRAPE_PROXY: ${{ secrets.SCRAPE_PROXY }}
+
+      # ④ 直播场次归档（`kpi?` 数据源）—— 口袋 getLiveList{record:true} 翻页拿
+      #    ctime + duration，按自然日并集写进 R2 `live:sess:<day>`。
+      #    只回溯 3 天（每 10 分钟一轮，足够覆盖「在播时长一直在涨」的更新）。
+      #    首次补历史用 workflow_dispatch 手动跑：SINCE=20261101 MAX_PAGES=400
+      - name: ④ 直播场次归档（KPI）
+        if: always()
+        continue-on-error: true
+        run: node live-session-archive.mjs
+        env:
+          SITE_URL: ${{ vars.SITE_URL }}
+          INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
+          POCKET48_TOKEN: ${{ secrets.POCKET48_TOKEN }}
+          SCRAPE_PROXY: ${{ secrets.SCRAPE_PROXY }}
+          DAYS: '3'

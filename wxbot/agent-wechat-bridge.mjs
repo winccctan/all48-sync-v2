@@ -741,6 +741,12 @@ async function naturalCmd(q) {
   else if (iRb >= 0) kind = 'rb';
   /* 年度之星：没提鸡腿/红蓝、但提到 mvp/年度之星/星梦值 ⇒ 走 mvp */
   if (!kind && /年度之星|mvp|星梦值/i.test(s)) kind = 'mvp';
+  /* 直播 KPI（2026-11-15 站长：「kpi?具体成员 / 队伍 / group 按月看」）——
+     自然语言「贺宇晨11月的KPI」「NIII 直播考核」也认，别丢给模型去编。 */
+  if (!kind && /\bkpi\b|直播\s*kpi|直播考核|直播天数/i.test(s)) kind = 'kpi';
+  /* 「贺宇晨计分明细」这种只说了「明细」没说是鸡腿还是红蓝的 ⇒ 默认按鸡腿明细
+     （红蓝明细要先提「红蓝」；纯追问交给 followUpOf 按上一条的记忆走） */
+  if (!kind && /明细|详细|具体/.test(s)) kind = 'lg';
   if (!kind) return null;
 
   /* 「全团 / 全员 / 全体」—— `rb?全团` 云端直接出团汇总（2026-11-12 站长群里问「查全团的红蓝」，
@@ -945,9 +951,45 @@ async function whoCtx(min = 30) {
   } catch { return ''; }
 }
 
+/* ---------------- 追问记忆（2026-11-15） ----------------
+   场景：群友先问「rb? 贺宇晨」，接着 @bot 只打「计分明细」。规则层认不出没带名字的追问，
+   于是整条被静默丢掉（站长连撞两晚）。这里按群记住「上一次查的是谁」。
+   🔴 只记人名和指令类型，不记任何人发过什么话；20 分钟自动过期，桥重启就清空。 */
+const LASTQ = new Map();          // chat → {kind, name, at}
+const LASTQ_TTL = 20 * 60e3;
+
+/** 这句话是不是「接着上一条看明细」？是就返回补好名字的指令对象。 */
+function followUpOf(chat, plain) {
+  const s = String(plain || '').replace(/[\s\u2005]+/g, '').trim();
+  if (!s || s.length > 14) return null;
+  /* 「计分明细 / 红蓝明细 / 鸡腿明细 / 明细 / 详细 / 具体点 / 展开」都算追问 */
+  if (!/^(?:帮我|再|看|查|来)?(?:计分|积分|分数|送礼人?|鸡腿|红蓝|榜单?)?(?:的)?(?:明细|详细|具体|展开|全量|全部)(?:呢|吧|啊|呀|呗|一下|一点|点)?$/.test(s)) return null;
+  const q = LASTQ.get(chat);
+  if (!q || Date.now() - q.at > LASTQ_TTL) return null;
+  return { kind: q.kind, name: String(q.name || '').trim() + ' 明细', follow: 1 };
+}
+
+/** 把「一个月的鸡腿」里的时间词揪出来，原样交给云端 perfRange。
+ *  ✅ 云端认这些：一个月 / 近30天 / 本月 / 这个月 / 上个月 / 近N天 / 昨天 / 今天 / 11-13 */
+function timeWord(s) {
+  const t = String(s || '');
+  let m;
+  if ((m = /(上个月|上月)/.exec(t))) return m[1];
+  if ((m = /(这个月|本月|当月)/.exec(t))) return m[1];
+  if ((m = /(近\s*\d{1,2}\s*个?月|最近\s*\d{1,2}\s*个?月)/.exec(t))) return m[1];
+  if ((m = /(一个?月|三十天|30\s*天)/.exec(t))) return '一个月';
+  if ((m = /(近\s*\d{1,2}\s*天|最近\s*\d{1,2}\s*天)/.exec(t))) return m[1];
+  if ((m = /(前天|昨天|昨日|今天|今日)/.exec(t))) return m[1];
+  if ((m = /(\d{1,2})\s*[月\-\/.]\s*(\d{1,2})\s*日?/.exec(t))) return m[1] + '-' + m[2];
+  /* 「11月 / 11月份 / 2026年11月」—— 2026-11-15 站长：「贺宇晨11月的鸡腿 查不到」。
+     没有这一支时 timeWord 回空 ⇒ 整句只带人名，云端按近 7 天答（看着像查错了）。
+     放在日号之后：`11月13日` 优先按单日走。 */
+  if ((m = /(?:(\d{4})\s*年\s*)?(\d{1,2})\s*月份?/.exec(t))) return (m[1] ? m[1] + '年' : '') + m[2] + '月';
+  return '';
+}
+
 /** 一条消息要不要交给模型：`ai?问题` 前缀、@ 了本号（真 @ 或手打 @名字） */
-function aiWanted(m, text) {
-  if (!AI_ON) return '';
+function aiWanted(m, text) {  if (!AI_ON) return '';
   const t = String(text || '').trim();
   const pre = /^(?:ai|问|小48)\s*[?？:：,，.。!！]?\s*([\s\S]+)$/i.exec(t);
   if (pre) return pre[1].trim().slice(0, 500);
@@ -1666,6 +1708,33 @@ async function handle(ev) {
 
   /* 自然语言查询（「帮我查陈淑钰的鸡腿」）—— 必须先于 AI，否则模型拿红蓝分冒充鸡腿 */
   if (!c) { try { c = await naturalCmd(plain); } catch { c = null; } }
+  /* 🔴 群里的「追问」（2026-11-15 站长截图：查完贺宇晨的红蓝卡，接着 @bot 说「计分明细」，
+     机器人一声不吭）。规则层的指令必须自己带名字，追问只有「明细」两个字 ⇒ 认不出就静默了。
+     ⇒ 按群记「上一句查的是谁」（20 分钟有效），追问时把名字补回来。 */
+  if (!c) {
+    const fo = followUpOf(chat, plain);
+    if (fo) c = fo;
+  }
+  /* 🔴 时间词要跟着人名一起下发（2026-11-15：「贺宇晨一个月的鸡腿」）。
+     原来 naturalCmd 只回人名，「一个月」被丢掉 ⇒ 永远按近 7 天答。
+     这里把时间词原样拼进 `lg?名字 一个月`，由云端 perfRange 统一解析（一个月/本月/上个月/近30天…）。 */
+  if (c && /^(?:lg|gy)$/.test(String(c.kind || ''))) {
+    const tw = timeWord(plain);
+    const nm = String(c.name || '').trim();
+    if (tw && nm && nm.indexOf(tw) < 0 && !/[近本上昨前今]\S*天/.test(nm)) c.name = nm + ' ' + tw;
+    /* 「明细 / 全部」要传到云端才有用（云端 lg 的 wantAll 是看名字末尾那个词） */
+    if (/明细|详细|具体|全部/.test(plain) && !/(明细|详细|具体|全部)/.test(nm)) {
+      c.name = String(c.name || '').trim() + ' 明细';
+    }
+  }
+  /* 直播 KPI（2026-11-15）：「贺宇晨11月的KPI」「NIII 直播考核」——
+     kpi? 只认**月份**，不认「今天/近3天」（KPI 是按自然月算的），所以单独拼，
+     别把「今天」混进名字里导致认不出人。 */
+  if (c && c.kind === 'kpi') {
+    const nm = String(c.name || '').trim();
+    const mw = /((?:\d{4})\s*年\s*\d{1,2}\s*月份?|\d{1,2}\s*月份?|上个月|上月|这个月|本月|当月)/.exec(plain);
+    if (mw && nm && nm.indexOf(mw[1]) < 0) c.name = nm + ' ' + mw[1];
+  }
 
   /* 「XX 查询指令 / 用法 / 怎么用」→ 贴云端下发的说明（这条要排在 fy 展开之前）。
      🔴 问用法时**强制拉一次云端**：站长 2026-11-13 改了文案，旧进程要等 5~10 分钟
@@ -1788,9 +1857,23 @@ async function handle(ev) {
     log('指令请求失败：' + (e && e.message));
     return;
   }
-  if (!r || !r.ok || !r.reply) { log(`无结果 ${c.kind}:${c.name} → ${JSON.stringify(r).slice(0, 100)}`); return; }
+  if (!r || !r.ok || !r.reply) {
+    log(`无结果 ${c.kind}:${c.name} → ${JSON.stringify(r).slice(0, 100)}`);
+    /* 🔴 2026-11-15：查不到也**必须说一句**。整晚「机器人不理人」有两次就是这里静默返回，
+       群里只看到消息发出去、没有任何回音，谁也判断不出是没认出还是没数据。 */
+    if (/^(lg|rb|mvp|gy|zb|nb|kpi|xfj)$/.test(String(c.kind || ''))) {
+      await say(chat, '这条没查到结果（服务端这轮没返回），过一会儿再发一次试试～', '[无结果] ' + c.kind);
+    }
+    return;
+  }
 
   await say(chat, r.reply, c.kind + ':' + c.name);
+  /* 记住「这个群刚刚查的是谁」——给「计分明细」这种追问用。
+     只存人名，不存 uid、不存提问内容；20 分钟过期，桥重启即清。 */
+  if ((c.kind === 'lg' || c.kind === 'rb') && r.name) {
+    const keep = String(c.name || r.name).replace(/[\s\u2005]*(?:明细|详细|具体|全部)\s*$/, '').trim();
+    LASTQ.set(chat, { kind: c.kind, name: keep || String(r.name), at: Date.now() });
+  }
   /* 🔴 2026-11-15 站长：「一段话放不完，你可以分两条消息啊」。
      worker 用 `parts` 表示分段（`nb?group` 全站在播几百场，一条 1800 字塞不下），
      这里把第 2 段起逐条补发。上限 6 段，失败不重试 —— 重发一条长的更容易被微信拒。 */
@@ -1868,7 +1951,16 @@ async function say(chat, text, tag) {
      一旦第一轮其实已经发出，群里就会出现两条一模一样的答复（同一条指令回两遍）。
      带上 `--idempotency-key`（同 chat + 同正文 ⇒ 同 key）以后重试是安全的；
      `--wait` 明确给足 45 秒，让 daemon 有机会在本轮把结果等出来。 */
-  const idem = 'br-' + createHash('sha1').update(chat + '\u0000' + body).digest('hex').slice(0, 24);
+  /* 🔴🔴 2026-11-15 重大修复：幂等键**必须每次发送唯一**。
+     原来 key = sha1(chat + 正文)，于是「同一个群、同一段回复」永远同一把钥匙。
+     微信侧对重复的 idempotency-key **直接丢弃**（连 state/serverId 都不返回，退出码 0、看起来成功）。
+     表现（站长今晚连撞三次）：`rb? 贺宇晨` 第一次有回复，之后再问**群里毫无反应**；
+     换个人（王珺）第一次问就有 —— 因为正文不同、key 不同。
+     我已在容器里实测：同 key 发两次，第二次输出为空（被吞）。
+     ⇒ key 里加一次性 nonce：一次 say() 内部重试仍用同一把（保持「重试不重复发」），
+       但不同次调用一定不同（保证「再问一次照样有回复」）。 */
+  const nonce = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+  const idem = 'br-' + createHash('sha1').update(chat + '\u0000' + body + '\u0000' + nonce).digest('hex').slice(0, 24);
   for (let i = 1; i <= 2; i++) {
     try {
       await wx(['--account', ACCOUNT, '--json', 'messages', 'send', chat, '--text', body,
