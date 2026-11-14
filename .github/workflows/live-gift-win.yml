@@ -83,3 +83,17 @@ jobs:
           LG_MAX: '120'
           LG_PAGES: ${{ inputs.pages }}
           LG_CONC: ${{ inputs.conc }}
+
+      # ③ 在播在线人数（`nb?` 数据源）—— 挂在这条「一定会跑」的 job 里：
+      #    live-now.yml 单独开着却从不触发（created 后 runs=0，实测 2 小时零运行），
+      #    所以改成寄生：10 分钟一轮，够 nb? 用了。
+      #    人数 = 云信聊天室在线成员数；口袋的 onlineNum 是热度，不能用。
+      - name: ③ 在播在线人数（聊天室口径）
+        if: always()
+        continue-on-error: true
+        run: node live-now-push.mjs
+        env:
+          SITE_URL: ${{ vars.SITE_URL }}
+          INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
+          POCKET48_TOKEN: ${{ secrets.POCKET48_TOKEN }}
+          SCRAPE_PROXY: ${{ secrets.SCRAPE_PROXY }}
