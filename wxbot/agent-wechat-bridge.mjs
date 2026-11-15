@@ -2424,10 +2424,26 @@ async function sayImage(chat, url) {
     const ext = ((/\.(jpg|jpeg|png|gif|webp)(?:\?|#|$)/i.exec(u) || [])[1] || 'jpg').toLowerCase();
     const file = `${IMG_DIR}/${createHash('md5').update(u).digest('hex').slice(0, 16)}.${ext}`;
     if (!existsSync(file)) {
-      const r = await fetch(u, { signal: AbortSignal.timeout(30000) });
-      if (!r.ok) { log(`图片下载失败 HTTP ${r.status}：${u.slice(0, 60)}`); return false; }
-      const buf = Buffer.from(await r.arrayBuffer());
-      if (buf.length < 200) { log('图片太小，丢弃：' + u.slice(0, 60)); return false; }
+      /* 🔴 下载重试 3 次：2026-11-15 实测容器里同一张云信 NOS 图「10:02 失败、10:11 手动成功」，
+         是瞬时网络抖动而不是域名不可达（curl 与 node fetch 手动测都 200）。
+         以前一次失败就放弃 ⇒ 群里只剩上面那条 `[图片]` 文字，看起来就是「图片没发出来」。 */
+      let buf = null, lastE = '';
+      for (let i = 0; i < 3 && !buf; i++) {
+        try {
+          const r = await fetch(u, { signal: AbortSignal.timeout(30000) });
+          if (!r.ok) lastE = 'HTTP ' + r.status;
+          else {
+            const b = Buffer.from(await r.arrayBuffer());
+            if (b.length < 200) lastE = '太小 ' + b.length + 'B';
+            else buf = b;
+          }
+        } catch (e) {
+          lastE = String((e && e.message) || e)
+            + '/' + String((e && e.cause && (e.cause.code || e.cause.message)) || '');
+        }
+        if (!buf) await sleep(1500);
+      }
+      if (!buf) { log(`图片下载失败（3 次）：${lastE} ${u.slice(0, 50)}`); return false; }
       writeFileSync(file, buf);
     }
     const gap = Date.now() - (lastSent.get(chat) || 0);
@@ -2702,11 +2718,25 @@ async function sendGroup(g, its) {
       });
     }
   }
-  /* 文本之后逐张补发真图；一张失败不影响其余 */
-  for (const im of imgs) {
-    const gi = await sayImage(g, im);
+  /* 文本之后逐张补发真图；一张失败不影响其余。
+     🔴 2026-11-15 站长：「图片没发出来」。日志统计 41 次图片发送：成功 21、微信退出码 5 共 15。
+        退出码 5 = 提交回执 `accepted_by_daemon` 但没等到确认，实测集中在
+        07:43–07:45 那波**连续 8 张、每张只隔 13 秒**的时候 —— 是连发图触发风控，不是下载问题。
+        ⇒ 单批最多发 2 张，剩下的塞回待发队列下一轮再发（群之间本来就有 5 秒轮转间隔），
+          把「8 张挤一起」摊成「每轮 2 张」。 */
+  const imgItems = its.filter((x) => String(x.img || '').trim());
+  const MAX_IMG = 2;
+  for (const it of imgItems.slice(0, MAX_IMG)) {
+    const gi = await sayImage(g, String(it.img).trim());
     if (!gi) log(`图片没发出去（${g}）`);
     await sleep(600);
+  }
+  const restImg = imgItems.slice(MAX_IMG);
+  if (restImg.length) {
+    if (!pullBacklog.has(g)) pullBacklog.set(g, []);
+    const arr = pullBacklog.get(g);
+    for (const it of restImg) arr.push(it);
+    log(`图片排队：本轮先发 ${MAX_IMG} 张，剩 ${restImg.length} 张下一轮（避免连发被风控）`);
   }
   /* 图片之后补语音原声（转写失败的才带 voice 字段） */
   for (const vo of voices) {
@@ -2762,6 +2792,54 @@ async function pump() {
 const CTL_EVERY = 10 * 1000;
 const SELF = String(process.argv[1] || '');
 const QR_BASE = '/tmp/all48-login-qr.png';
+
+/* ---------------- 长连接守护（2026-11-15 站长要求） ----------------
+ * 「桥每 5 分钟检查一次长连接进程，发现不在就自动重启」。
+ *
+ * 🔴 为什么必须补这一段：`/app/nim/run.sh` 自己是带 while 守护的，但
+ *    · 桥的启动钩子只在**桥启动那一刻**跑一次；
+ *    · run.sh 本身也会死（OOM / 容器重启时被带走 / 手动 kill 错进程）；
+ *    ⇒ 一旦一起没了，就再没人管。实测 2026-11-14 20:23 ~ 11-15 18:00 这 21 小时里，
+ *     长连接一直没在干活，群里全靠 Actions 那条 5 分钟兜底，
+ *     表现就是站长问的「推送不应该是实时的吗」。
+ *
+ * 🔴 只查**进程存活**，不猜业务状态：进程在但不干活的「假死」这里救不了，
+ *    那种要看 client.log 里的「状态 giftQ=… 订阅=…」行（订阅数掉下去就是断订）。
+ * 🔴 进程名用 `client[.]mjs` 而不是 `client.mjs` —— 否则 pgrep 会匹配到
+ *    本条命令自己的 shell（踩过：kill 掉了正在执行诊断的 shell 本身）。 */
+const NIM_RUN = '/app/nim/run.sh';
+const NIM_PAT = 'node /app/nim/nim-client/client[.]mjs';
+const NIM_CHECK = Math.max(60e3, Number(process.env.WX_NIM_CHECK || 5 * 60e3));
+
+function nimAlive() {
+  return new Promise((res) => {
+    try {
+      const p = spawn('/bin/sh', ['-c', `pgrep -f '${NIM_PAT}' | head -1`],
+        { stdio: ['ignore', 'pipe', 'ignore'] });
+      let o = '';
+      p.stdout.on('data', (d) => { o += d; });
+      p.on('error', () => res(''));
+      p.on('close', () => res(String(o).trim()));
+    } catch { res(''); }
+  });
+}
+
+async function nimGuard() {
+  if (!existsSync(NIM_RUN)) return;          // 本机跑桥时没有这个路径，直接不启用
+  log('守护：长连接每 ' + Math.round(NIM_CHECK / 60e3) + ' 分钟检查一次');
+  for (;;) {
+    await sleep(NIM_CHECK);
+    try {
+      if (await nimAlive()) continue;
+      log('守护：长连接进程不在，重新拉起 ' + NIM_RUN);
+      const p = spawn('/bin/sh', [NIM_RUN], { detached: true, stdio: 'ignore' });
+      p.on('error', (e) => log('守护：拉起失败 ' + ((e && e.message) || e)));
+      p.unref();
+      await sleep(25e3);
+      log('守护：' + (await nimAlive() ? '已恢复' : '拉起后仍没有进程，等下一轮'));
+    } catch (e) { log('守护异常：' + ((e && e.message) || e)); }
+  }
+}
 
 /* 版本 = 自身文件 sha1 前 8 位。改没改一眼看得出来，不用手工维护版本号。 */
 let SELF_VER = '';
@@ -3231,5 +3309,6 @@ else {
 
   pump();
   void ctlLoop();
+  void nimGuard();     // 长连接看护：每 5 分钟确认进程还在，不在就拉起
   watch();
 }
