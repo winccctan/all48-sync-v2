@@ -415,14 +415,27 @@ async function tickOne(w, st, lives, first) {
      🔴 后台/指令加进来的成员可能还没有房间号（名册里 srv/ch 是 0）——
         这种情况**只播开播/下播**，不要去拉房间（拉必报错，日志会被刷满，还白等超时）。 */
   const now = Date.now();
-  // 游标为空（第一次跑）或落后太多 ⇒ 只补最近 10 分钟，绝不把整段历史倒进群
-  const floor = now - Math.max(1, Number(process.env.WX_SINCE_MIN) || 10) * 60e3;
-  const since = Math.max(Number(st.roomT) || 0, floor);
+  /* 回扫窗口。
+     🔴 2026-11-15 事故（站长：「群里又丢了王语晨的消息」）：
+        17:31 那轮把游标停在 17:30:02，下一次真正拉到房间消息已是 17:4x，
+        窗口下限（当时 10 分钟）被抬到 17:32 ⇒ 17:30:12 / 17:30:35 两句被**静默跳过**。
+        根因是 Actions 轮次会排队（cron 5 分钟 + 单轮 270s + checkout），
+        高峰期出现 10 分钟以上空档很正常，10 分钟的窗根本盖不住。
+     ⇒ 已跑到过的成员默认回扫 **30 分钟**；首次跑（游标为空）仍只补 10 分钟，
+        避免第一次接入把半小时的历史一口气倒进群。窗口被下限抬高时**打日志**，不再无声无息。 */
+  const BACK_MIN = Math.max(1, Number(process.env.WX_SINCE_MIN) || (first ? 10 : 30));
+  const floor = now - BACK_MIN * 60e3;
+  const cursor0 = Number(st.roomT) || 0;
+  const since = Math.max(cursor0, floor);
+  if (cursor0 && since > cursor0 + 1000) {
+    log(`${w.nick}：⚠️ 房间窗口被截断，跳过 ${Math.round((since - cursor0) / 60e3)} 分钟`
+      + `（${bjTime(cursor0)} ~ ${bjTime(since)} 这区间的发言本轮不会补）`);
+  }
   if (!w.srv || !w.ch) {
     if (first) log(`${w.nick}：没有房间号（srv/ch），本轮只播开播/下播`);
   } else try {
     const msgs = await collect(since, w);
-    if (first) log(`${w.nick}：最近 10 分钟她有 ${msgs.length} 条本人发言`);
+    if (first) log(`${w.nick}：最近 ${BACK_MIN} 分钟她有 ${msgs.length} 条本人发言`);
     if (msgs.length) {
       const newest = msgs[msgs.length - 1].t;
       /* 🔴 2026-11-14 站长：「消息不要一起发，不应该有消息就马上发吗」。
