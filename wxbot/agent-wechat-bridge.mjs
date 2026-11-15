@@ -123,7 +123,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
  *  换算错会让所有消息被判成「历史」而静默丢弃，所以这里必须按数量级判断，不能瞎乘。 */
 function msgTimeMs(m) {
   if (!m || typeof m !== 'object') return 0;
-  const raw = m.createTime ?? m.create_time ?? m.committedAt ?? m.timestamp ?? m.time ?? 0;
+  const raw = m.createTime ?? m.create_time ?? m.createdAt ?? m.committedAt ?? m.timestamp ?? m.time ?? 0;
   if (raw == null || raw === '') return 0;
   if (typeof raw === 'string' && !/^\d+$/.test(raw.trim())) {
     const t = Date.parse(raw);
@@ -1735,14 +1735,26 @@ async function handle(ev) {
   /* 🔴 `messages get` 会偶发超时（2026-11-12 22:49 实测「处理异常：wx 超时」，
      那条指令就这么静默丢了）。重试一次；还失败就用事件自带字段兜底 —— 事件里
      一般就有 body/type，缺的只是 mentions，宁可漏判 @ 也别整条吞掉。 */
+  /* 🔴 取正文主路改走 `messages list`（实测 4~5 秒，body/mentions/type 全在）。
+     `messages get` 在「消息刚落地、本地库还没投影完」时会一直等到超时，20 秒 ×2 = 40 秒，
+     后面所有指令全堵在队列里 —— 表现就是「@bot 发什么都不理」（2026-11-15 站长那条
+     `@boooot 1` 就是这么被吞的，日志里只剩 `收 35054432 :` 空内容）。get 降级为兜底。 */
   let m = null;
-  for (let i = 1; i <= 2 && !m; i++) {
+  try {
+    const j = jsonOf(await wx(['--account', ACCOUNT, '--json', 'messages', 'list', chat, '--limit', '20'], 15000));
+    const arr = (j && (j.items || j.messages || j.list)) || [];
+    const want = String(d.messageId || '');
+    m = arr.find((x) => String(x.id || x.localId || '') === want) || null;
+  } catch (e) {
+    log('messages list 失败：' + String((e && e.message) || e).slice(0, 90));
+  }
+  /* 兜底：按 id 单取 */
+  if (!m) {
     try {
-      const j = jsonOf(await wx(['--account', ACCOUNT, '--json', 'messages', 'get', String(d.messageId)], 20000));
+      const j = jsonOf(await wx(['--account', ACCOUNT, '--json', 'messages', 'get', String(d.messageId)], 12000));
       m = (j && (j.message || j)) || null;
     } catch (e) {
-      log(`messages get 失败（${i}/2）：${String((e && e.message) || e).slice(0, 100)}`);
-      if (i < 2) await sleep(800);
+      log('messages get 兜底失败：' + String((e && e.message) || e).slice(0, 90));
     }
   }
   if (!m) {
@@ -2094,7 +2106,9 @@ async function say(chat, text, tag) {
     try {
       await wx(['--account', ACCOUNT, '--json', 'messages', 'send', chat, '--text', body,
         '--idempotency-key', idem, '--wait', '45'], 55000);
-      log(`已回群 ${chat}：${tag}${i > 1 ? '（第 ' + i + ' 次成功）' : ''}`);
+      /* 🔴 日志必须带内容摘要：只打 tag 时「已回群 … rb: 」根本看不出到底发了什么，
+         排查「机器人不回复」就会误判成成功（2026-11-15 站长两次报「不回复」都卡在这）。 */
+      log(`已回群 ${chat}：${tag}｜${String(body).replace(/\s+/g, ' ').slice(0, 40)}${i > 1 ? '（第 ' + i + ' 次成功）' : ''}`);
       rejectStreak = 0;
       if (pauseLevel) log(`✅ 微信恢复发送（原冷却第 ${pauseLevel} 级）⇒ 正常推送，等级清零`);
       pauseLevel = 0; pushPauseUntil = 0;
@@ -2837,20 +2851,70 @@ async function ctlRun(c) {
       R.ok = true;
 
     } else if (op === 'qr') {
-      try { unlinkSync(QR_BASE); } catch { }
-      /* --detach：立即返回，不阻塞 5 分钟等扫码；--force-qr：跳过设备信任，强制出码 */
-      const out = await wx(['auth', 'login', '--strategy', 'qr', '--force-qr',
-        '--qr-output', QR_BASE, '--detach', '--json'], 30000);
-      let f = null;
-      for (let i = 0; i < 30 && !f; i++) { await sleep(500); f = newestQr(); }
-      if (!f) {
-        R.out = '没等到二维码文件。CLI 原始输出：\n' + String(out || '').slice(0, 800);
-      } else {
-        const b64 = readFileSync(f).toString('base64');
-        R.qr = 'data:image/png;base64,' + b64;
-        R.out = '二维码已生成（' + Math.round(b64.length / 1024) + 'KB）：用手机微信「扫一扫」扫上面的图。'
-          + '\n二维码约 2 分钟过期，过期再点一次即可。';
+      /* 🔴 CLI 2.3.2 已经**没有** `--force-qr` / `--qr-output` / `--detach` 这三个参数了（老版才有）。
+         照老写法直接被判 invalid_arguments ⇒ 后台页面点「重新扫码登录」毫无反应，也不出码
+         （2026-11-15 站长：「点重新登录没有要求扫码」就是踩了这个）。
+         现行三步（本机 + 容器都实测通）：
+           1) `auth login --strategy qr` **后台**跑（前台会阻塞 300 秒等扫码，不能等）
+           2) 从 login-receipts 新落的那份里取 operationId
+           3) `auth qr <id> --output <png>` 把图导出来
+         若已有登录尝试在进行，login 会回 operation_in_progress ⇒ 直接复用那份，不重复起。 */
+      const OUT = QR_BASE;
+      const RD = XDG + '/agent-wechat/login-receipts';
+      /* 🔴 已经登录在线时 `auth login` 会**直接成功**（走设备信任），operation 里压根没有二维码，
+         再 `auth qr` 就报 `login operation has no QR generation`（2026-11-15 实测）。
+         ⇒ 先看状态，在线就直接告诉他不用扫，别去踹那个必然失败的接口。 */
+      const a0 = await ctlAuth(true);
+      if (a0.online) {
         R.ok = true;
+        R.out = '当前已经登录在线（' + (a0.raw || '在线') + '），不需要扫码。\n'
+          + '二维码只在掉线时才用得上；真要换号，先在容器里 `wx auth logout` 再点这个按钮。';
+      } else {
+      try { unlinkSync(OUT); } catch { }
+      const since = Date.now() - 2000;
+      try {
+        const p = spawn(WX, ['--account', ACCOUNT, '--json', 'auth', 'login', '--strategy', 'qr'],
+          { env: { ...process.env, XDG_CONFIG_HOME: XDG }, stdio: 'ignore', detached: true });
+        p.on('error', () => { });
+        p.unref();
+      } catch { }
+
+      /* 等新收据落盘（服务端分配 operationId 要点时间），最多约 15 秒 */
+      let oid = '', newest = null;
+      for (let i = 0; i < 50 && !oid; i++) {
+        let items = [];
+        try { items = readdirSync(RD).filter((f) => f.endsWith('.json')); } catch { }
+        for (const f of items) {
+          const fp = RD + '/' + f;
+          let st; try { st = statSync(fp); } catch { continue; }
+          let j = null; try { j = JSON.parse(readFileSync(fp, 'utf8')); } catch { continue; }
+          const id = String((j && j.operationId) || '');
+          if (!id) continue;
+          if (st.mtimeMs >= since) { oid = id; break; }          // 刚起的那份优先
+          if (!newest || st.mtimeMs > newest.t) newest = { id, t: st.mtimeMs };
+        }
+        /* 起不来新收据（已有尝试在进行 ⇒ operation_in_progress）就复用最近那份 */
+        if (!oid) { if (i >= 6 && newest) { oid = newest.id; break; } await sleep(300); }
+      }
+
+      if (!oid) {
+        R.out = '没拿到登录尝试的 operationId（收据目录：' + RD + '）。';
+      } else {
+        const out = await wx(['--account', ACCOUNT, '--json', 'auth', 'qr', oid, '--output', OUT], 30000);
+        let f = null;
+        for (let i = 0; i < 20 && !f; i++) {
+          if (existsSync(OUT) && statSync(OUT).size > 500) f = OUT; else await sleep(300);
+        }
+        if (!f) {
+          R.out = '二维码没导出。CLI 输出：\n' + String(out || '').slice(0, 600);
+        } else {
+          const b64 = readFileSync(f).toString('base64');
+          R.qr = 'data:image/png;base64,' + b64;
+          R.out = '二维码已生成（' + Math.round(b64.length / 1024) + 'KB，attempt ' + oid.slice(0, 8) + '）：'
+            + '手机微信「扫一扫」扫上面的图确认登录。\n约 5 分钟有效，过期再点一次即可。';
+          R.ok = true;
+        }
+      }
       }
 
     } else if (op === 'groups') {

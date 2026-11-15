@@ -93,6 +93,27 @@ const EVERY = Math.max(10, Number(process.env.EVERY || 20)) * 1000;
 const DRY = !!process.env.DRY;
 const HDR = { 'x-ingest-token': INGEST, 'content-type': 'application/json' };
 
+/** 语音转文字（只用于语音翻牌的 aac）。
+ *  口袋的 AUDIO_GIFT_REPLY **只给 voiceUrl，没有任何文字版**（2026-11-15 dump 实测），
+ *  所以走云端 `/api/asr`（Workers AI whisper，账号免费额度，结果按音频 URL 缓存在 R2，
+ *  同一条语音只真正转一次）。转不出来就返回空串，调用方会带 voiceUrl 让桥发语音原声兜底。 */
+async function asrOf(u) {
+  const s = String(u || '').trim();
+  if (!s) return '';
+  try {
+    const r = await fetch(`${WORKER}/api/asr`, {
+      method: 'POST', headers: HDR,
+      body: JSON.stringify({ u: s }), signal: AbortSignal.timeout(30000),
+    });
+    const j = await r.json().catch(() => null);
+    if (j && j.ok && j.text) return String(j.text).slice(0, 300);
+    if (j && !j.ok) log('ASR 没转出来：' + String(j.e || '').slice(0, 70));
+  } catch (e) {
+    log('ASR 请求失败：' + String((e && e.message) || e).slice(0, 70));
+  }
+  return '';
+}
+
 const BJ = 8 * 3600e3;
 const p2 = (n) => String(n).padStart(2, '0');
 function bjTime(ms, withDate) {
@@ -207,6 +228,7 @@ function line(m) {
      bodys 里是云信 NOS 直链：{"size":638754,"ext":"jpg","w":3024,"url":"https://kd48-nosdn...","md5":"..."}
      ⇒ 把 url 带出去，桥下载后用 `wx send --image` 真发一张，而不是干巴巴一个 [图片]。 */
   let img = '';
+  let voice = '';
   if (type === 'TEXT') content = String(body || '').trim();
   else if (type === 'IMAGE') {
     content = '[图片]';
@@ -231,6 +253,10 @@ function line(m) {
     const q = String(info.replyText || info.question || '').trim();
     if (type === 'AUDIO_GIFT_REPLY') {
       content = '[语音翻牌]' + (q ? ' ' + q : '');
+      /* 🔴 2026-11-15 站长：「语音回复没有转为文字呢」。
+         实测 bodys 里**只有 voiceUrl（aac）+ replyText（礼物描述）+ duration，没有任何转写**，
+         要文字只能自己转 ⇒ 把音频地址带出去，由 asrOf() 交给云端 whisper 出文本。 */
+      voice = String(info.voiceUrl || '');
     } else {
       const txt = (ans || pickText(body) || q).slice(0, 120);
       content = '[翻牌]' + (txt ? ' ' + txt : '');
@@ -245,7 +271,7 @@ function line(m) {
   else return null;
 
   if (!content) return null;
-  return { t: Number(m.msgTime) || 0, text: content, img };
+  return { t: Number(m.msgTime) || 0, text: content, img, voice };
 }
 
 /** 取 since 之后本人发的消息（最多往回翻 6 页，避免 runner 时间被吃光）
@@ -318,9 +344,12 @@ async function tickOne(w, st, lives, first) {
      别人 bot 给的是 `💡[17:55:02]上线了` —— 上线必须用她真正开口的那一刻，
      而且时间戳要早于/等于消息，桥按 t 排序时才会排在消息前面。 */
   const acts = [];
-  const add = (id, t, text, img) => items.push(img
-    ? { id, t, text, who: w.nick, img }
-    : { id, t, text, who: w.nick });
+  const add = (id, t, text, img, voice) => {
+    const o = { id, t, text, who: w.nick };
+    if (img) o.img = img;
+    if (voice) o.voice = voice;      // 只有语音转写失败才带（桥用 --voice 发原声兜底）
+    items.push(o);
+  };
 
   /* ① 开播 / 下播 */
   let cur = null;
@@ -400,11 +429,26 @@ async function tickOne(w, st, lives, first) {
          原先多条合并成一条「N 条新消息」的文本，她连着刷屏时就变成一坨，
          群里看起来既像延迟又像刷屏。改成**逐条入队**（每条各自一个 id），
          桥按 t 顺序一条一条发，来一条就是一条。 */
-      for (const it of msgs) {
-        add('room:' + w.uid + ':' + it.t, it.t,
-          `【${w.nick}·口袋房间】${bjTime(it.t)}\n${it.text}`);
+      /* 语音翻牌先统一转文字：并发 4 路（串行的话一轮 40 条能把 job 拖超时）。
+         转出来的追加一行「🎙 内容」；转不出来才把 voiceUrl 交给桥发原声。 */
+      const asrTxt = new Array(msgs.length).fill('');
+      const needIdx = msgs.map((x, i) => (x.voice ? i : -1)).filter((i) => i >= 0);
+      for (let k = 0; k < needIdx.length; k += 4) {
+        await Promise.all(needIdx.slice(k, k + 4).map(async (i) => {
+          asrTxt[i] = await asrOf(msgs[i].voice);
+        }));
       }
-      next.roomT = newest;
+      for (let idx = 0; idx < msgs.length; idx++) {
+        const it = msgs[idx];
+        let tx = it.text;
+        let voice = '';
+        if (it.voice) {
+          if (asrTxt[idx]) tx = tx + '\n🎙 ' + asrTxt[idx];
+          else voice = it.voice;
+        }
+        add('room:' + w.uid + ':' + it.t, it.t,
+          `【${w.nick}·口袋房间】${bjTime(it.t)}\n${tx}`, '', voice);
+      }      next.roomT = newest;
       active = true;                       // 有新发言 = 她在线
       acts.push(msgs[0].t, newest);        // 第一句（她真正上线的时刻）+ 最后一句
       next.lastKind = msgs.some((m) => /^\[翻牌\]/.test(m.text)) ? 'flip' : 'msg';
