@@ -25,6 +25,7 @@ import { spawn } from 'node:child_process';
 import { readFileSync, writeFileSync, appendFileSync, mkdirSync, existsSync, readdirSync, unlinkSync, statSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { dirname } from 'node:path';
+import { createRequire } from 'node:module';
 
 const WX = String(process.env.WX_BIN || `${process.env.HOME}/.workbuddy/binaries/agent-wechat/bin/wx`);
 const ACCOUNT = String(process.env.WX_ACCOUNT || 'test48');
@@ -47,6 +48,11 @@ const SILENT_UNTIL = existsSync(CURSOR) ? 0 : Date.now() + 3 * 60 * 1000;
 let COOLDOWN = Math.max(500, Number(process.env.WX_COOLDOWN || 1500));
 const DRY = process.argv.includes('--dry');
 const PING = process.argv.includes('--ping');
+/* `--nb 名字` 自检：算一遍在线人数+昵称并让云端出图，只打印不群发 */
+const NB_TEST = (() => {
+  const i = process.argv.indexOf('--nb');
+  return i > 0 ? String(process.argv[i + 1] || '').trim() : '';
+})();
 
 /* ── AI 聊天（2026-11-12 站长：「可以 @ 机器人可以和它聊天吗 给它ai的功能」）──────
    设计取舍：
@@ -205,6 +211,14 @@ function cmdOf(raw) {
   if (m) return { kind: 'fy', name: String(m[1] || '').trim().slice(0, 60) || ' ' };
   m = /^发言\s*[?？:：,，.。、!！]\s*([\s\S]*)$/.exec(s);
   if (m) return { kind: 'fy', name: String(m[1] || '').trim().slice(0, 60) || ' ' };
+  /* nb?名字 / nb?group —— 直播间当前观看人数 + 观众昵称。
+     🔴 只认**带分隔符**的写法（`nb?王语晨`、`在线?niii`）：不带问号的 `nb xxx`
+        交给云端指令表（cloudCmd 认前缀），不会有歧义。
+     识别出来是为了 handle 里能走「出图」那条路；认不出人/队伍仍回落到 worker 的文字版。 */
+  m = /^(?:nb|online)\s*[?？:：,，.。、!！]\s*([\s\S]*)$/i.exec(s);
+  if (m) return { kind: 'nb', name: String(m[1] || '').trim().slice(0, 40) || ' ' };
+  m = /^在线\s*[?？:：,，.。、!！]\s*([\s\S]*)$/.exec(s);
+  if (m) return { kind: 'nb', name: String(m[1] || '').trim().slice(0, 40) || ' ' };
   return null;
 }
 
@@ -1935,6 +1949,27 @@ async function handle(ev) {
     return;
   }
 
+  /* `nb?名字` 直接出图 —— 2026-11-15 站长：「nb?名字 不就是查在线 n 人和所有昵称，能不能返回一张图，
+     这样就不用在意会不会显示完整了，我要的是直播在的当前观看人数」「要的是直播在的观看人数和观看的人的昵称」。
+     🔴 在不在播由**桥自己查口袋 getLiveList** 判定，不用云端那份 live:now 快照（实测会滞后 1 小时以上）。
+     出不了图（不是成员名 / 云信超时 / 没认出名册）就继续往下走 worker 的文字版，不会没回音。 */
+  if (c.kind === 'nb' && c.name) {
+    try {
+      const got = await nbCardByName(c.name);
+      if (got && got.off) {
+        await say(chat, '【' + got.name + '】现在没在直播\n看看谁在播：nb?group', 'nb:off');
+        return;
+      }
+      if (got && got.url) {
+        await say(chat, got.text, 'nb:card');
+        await sayImage(chat, got.url);
+        return;
+      }
+    } catch (e) {
+      log('nb 出图异常：' + String((e && e.message) || e).slice(0, 120));
+    }
+  }
+
   const u = new URL(WORKER + '/api/cmd');
   u.searchParams.set('k', KEY);
   /* `raw` = 云端登记的新指令：原文整句发过去，由 worker 自己解析 */
@@ -2090,6 +2125,215 @@ async function say(chat, text, tag) {
 const IMG_DIR = String(process.env.WX_IMG_DIR || `${XDG}/wxbot-img`);
 /* 语音原声缓存（只在转文字失败时才走到这里） */
 const VOICE_DIR = String(process.env.WX_VOICE_DIR || `${XDG}/wxbot-voice`);
+/* ═════════ 在线人数卡片（`nb?名字` 出图 · 2026-11-15）═════════
+ * 站长：「nb?名字 不就是查在线 n 人和所有昵称，能不能返回一张图，这样就不用在意会不会
+ *   显示完整了，我要的是直播在的当前观看人数」。
+ *
+ * 分工：**桥负责算，worker 负责画**。
+ *   算：只有桥这台上网机器能直连 pocketapi（云端出口被封 IP）和云信 weblink（需要长连接）。
+ *   画：容器里没有 canvas / 中文字体，worker 那边有 resvg-wasm + 思源黑体。
+ *
+ * 数据链：
+ *   GET  /api/pocket/ctx?q=名字      → 口袋 token（worker 只做名字→uid，token 也在那边）
+ *   POST /live/api/v1/live/getLiveOne → roomId（云信聊天室 id，注意不是 liveId）
+ *   GET  /api/live/nimcred           → 云信第二账号凭证（账号 1 进直播间恒 416）
+ *   13/13 getChatroom             → onlineMemberNum：**真·在线人数**
+ *   13/8  getChatroomMembers      → 房间里的成员 accid（type=1 = 游客）
+ *   13/9  getHistoryMsgs          → 弹幕，键 21 = 发送者 accid、键 4 里 user.nickName
+ *                                    （NIM 成员档案的 nick 口袋从不写，昵称只能从发言倒推）
+ *   POST /api/nb/card（worker）    → 存 KV 10 分钟，回一个 PNG 直链 → sayImage 发出去
+ */
+const NIM_APPKEY = '632feff1f4c838541ab75195d1ceb3fa';
+const NB_LIB = `${XDG}/nim-chatroom.cjs`;   // 云信协议实现，开机按需从 /api/wb/f 取
+
+async function pocketCtx(name) {
+  const u = new URL(WORKER + '/api/pocket/ctx');
+  u.searchParams.set('k', KEY);
+  u.searchParams.set('q', String(name || ''));
+  const r = await fetch(u, { signal: AbortSignal.timeout(12000) });
+  const j = await r.json().catch(() => null);
+  return (j && j.ok && j.token) ? j : null;
+}
+
+async function pocketPost(path, body, token) {
+  const r = await fetch('https://pocketapi.48.cn' + path, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json;charset=utf-8',
+      appInfo: POCKET_APPINFO, token: String(token), pa: 'POCKET48', 'user-agent': POCKET_UA,
+    },
+    body: JSON.stringify(body || {}),
+    signal: AbortSignal.timeout(15000),
+  });
+  return await r.json().catch(() => null);
+}
+
+async function nimCred2() {
+  try {
+    const r = await fetch(`${WORKER}/api/live/nimcred?k=${encodeURIComponent(KEY)}`, { signal: AbortSignal.timeout(12000) });
+    const j = await r.json().catch(() => null);
+    return (j && j.ok && j.accid && j.pwd) ? j : null;
+  } catch { return null; }
+}
+
+/** 云信协议实现：优先用本机已有的（容器里 /app/nim 那个常驻服务自带），没有再去云端取。
+ *  🔴 单文件更新通道装不下第二个文件，所以新机器走 /api/wb/f 自取。 */
+let nbLibCache = null;
+async function nimLib() {
+  if (nbLibCache) return nbLibCache;
+  const require2 = createRequire(import.meta.url);
+  for (const p of [NB_LIB, '/app/nim/nim-client/chatroom.cjs',
+    `${dirname(WX)}/../../../all48-live-sync/nim-client/chatroom.cjs`]) {
+    try {
+      /* 🔴 必须带 requestRaw：老版本（容器 /app/nim 那份）没有这层通用请求口，
+         用它就查不了成员/弹幕 ⇒ 认版本，不合格就换下一个。 */
+      if (!existsSync(p) || statSync(p).size < 3000) continue;
+      if (!/requestRaw/.test(readFileSync(p, 'utf8'))) continue;
+      nbLibCache = require2(p);
+      return nbLibCache;
+    } catch { /* 换下一个 */ }
+  }
+  try {
+    mkdirSync(XDG, { recursive: true });
+    const r = await fetch(`${WORKER}/api/wb/f?p=nim-chatroom.cjs&k=${encodeURIComponent(KEY)}`, { signal: AbortSignal.timeout(20000) });
+    if (!r.ok) { log('云信模块下载失败 HTTP ' + r.status); return null; }
+    const txt = await r.text();
+    if (txt.length < 3000) { log('云信模块内容异常 ' + txt.length); return null; }
+    writeFileSync(NB_LIB, txt);
+    nbLibCache = require2(NB_LIB);
+    return nbLibCache;
+  } catch (e) { log('云信模块加载失败：' + String((e && e.message) || e).slice(0, 100)); return null; }
+}
+
+/* 云信包里那套「PropertyArray / Property」解析：varint 个数 + (varint 键, varint 长度, 字节) */
+function nbRd(b, o) { let v = 0, s = 0, x; do { x = b[o++]; v += (x & 0x7f) * Math.pow(2, s); s += 7; } while (x & 0x80); return { v, o }; }
+function nbParseArr(buf) {
+  if (!buf || !buf.length) return [];
+  let p = nbRd(buf, 0); const n = p.v; let o = p.o;
+  const out = [];
+  for (let i = 0; i < n && o < buf.length; i++) {
+    p = nbRd(buf, o); const pairs = p.v; o = p.o;
+    const rec = {};
+    for (let k = 0; k < pairs; k++) {
+      p = nbRd(buf, o); const key = p.v; o = p.o;
+      p = nbRd(buf, o); const len = p.v; o = p.o;
+      rec[key] = buf.subarray(o, o + len).toString('utf8'); o += len;
+    }
+    out.push(rec);
+  }
+  return out;
+}
+const nbU8 = (n) => Buffer.from([Number(n) & 0xff]);
+const nbI32 = (n) => { const b = Buffer.alloc(4); b.writeInt32LE(Number(n)); return b; };
+const nbI64 = (n) => { const b = Buffer.alloc(8); b.writeBigInt64LE(BigInt(Math.trunc(Number(n)))); return b; };
+
+/** `nb?名字` 的图片版：**自己判断在不在播**（不依赖云端那份会过期的 live:now 快照），
+ *  在播就现查云信算出人数+昵称，交给 worker 出图。
+ *  返回：{text,url} 出图成功 / {off:true,name} 确实没在播 / null 该交给 worker 处理（队伍、group、认不出人） */
+async function nbCardByName(rawName) {
+  const nm = String(rawName || '').replace(/[\s\u2005]+/g, ' ').trim();
+  if (!nm) return null;
+
+  const ctx = await pocketCtx(nm);
+  if (!ctx) return null;               // 不是成员名（niii / group / 全团…）⇒ 走 worker 的文字
+  const uid = Number(ctx.uid) || 0;
+
+  let lives = [];
+  try {
+    const l = await pocketPost('/live/api/v1/live/getLiveList', { debug: true, next: '0', record: false }, ctx.token);
+    lives = (((l || {}).content || {}).liveList || []).filter((x) => x && x.liveId);
+  } catch (e) {
+    log('nb 出图：在播列表取不到 ' + String((e && e.message) || e).slice(0, 60));
+    return null;
+  }
+  const hit = lives.find((x) => Number((x.userInfo || {}).uid || 0) === uid)
+    || lives.find((x) => String((x.userInfo || {}).nickname || '').replace(/\s+/g, '').endsWith(String(ctx.n).replace(/\s+/g, '')));
+  if (!hit) return { off: true, name: ctx.n };
+
+  const one = (await pocketPost('/live/api/v1/live/getLiveOne', { liveId: String(hit.liveId) }, ctx.token) || {}).content || {};
+  const roomId = String(one.roomId || '');
+  if (!roomId) { log('nb 出图：getLiveOne 没 roomId'); return null; }
+
+  const cred = await nimCred2();
+  if (!cred) { log('nb 出图：云信凭证没拿到'); return null; }
+  const lib = await nimLib();
+  if (!lib) return null;
+
+  const cli = lib.createNimCommonlinkChatroomClient({ appKey: NIM_APPKEY, account: cred.accid, token: cred.pwd, roomId });
+  let online = 0, members = [], msgs = [];
+  try {
+    await Promise.race([
+      cli.connect(),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('connect timeout')), 20000)),
+    ]);
+    const info = await cli.getChatroomInfo();
+    online = Number(info && info.onlineMemberNum) || 0;
+    members = nbParseArr((await cli.requestRaw(13, 8, Buffer.concat([nbU8(1), nbI64(0), nbI32(100)]))).body);
+    /* 弹幕翻页补昵称：reverse=0 才是「越翻越早」，reverse=1 传游标会原地打转 */
+    let tag = 0;
+    for (let page = 0; page < 8; page++) {
+      const list = nbParseArr((await cli.requestRaw(13, 9, Buffer.concat([nbI64(tag), nbI32(100), nbU8(0), nbU8(0)]))).body);
+      if (!list.length) break;
+      let minTs = Infinity;
+      for (const m of list) { const ts = Number(m[20] || 0); if (ts && ts < minTs) minTs = ts; }
+      msgs = msgs.concat(list);
+      if (!Number.isFinite(minTs) || minTs === tag) break;
+      tag = minTs;
+    }
+  } catch (e) {
+    log('nb 出图：云信查询失败 ' + String((e && e.message) || e).slice(0, 80));
+    return null;
+  } finally {
+    try { cli.destroy(); } catch { /* noop */ }
+  }
+
+  /* accid → 昵称 */
+  const nickOf = new Map();
+  for (const m of msgs) {
+    const from = String(m[21] || '');
+    if (!from) continue;
+    let pl = {}; try { pl = JSON.parse(m[4] || '{}'); } catch { continue; }
+    const u = pl.user || {};
+    if (u.nickName) nickOf.set(from, String(u.nickName));
+  }
+  const others = members.filter((x) => String(x[2]) !== String(cred.accid));
+  const peers = [];
+  const seen = new Set();
+  for (const x of others) {
+    const nk = nickOf.get(String(x[2]));
+    if (!nk || seen.has(nk)) continue;
+    seen.add(nk);
+    peers.push(nk);
+  }
+
+  const real = Math.max(0, online - 1);   // 减掉机器人这个连接
+  const name = String(ctx.n || nm);
+  const t0 = Number(one.ctime) || 0;
+  const payload = {
+    name, online: real, total: others.length || real, t0, at: Date.now(),
+    heat: Number(one.onlineNum) || 0,
+    peers,
+    note: peers.length
+      ? '人数＝云信聊天室实时在线（含只看不说话的）；昵称只能认出最近发过言的粉丝'
+      : '人数＝云信聊天室实时在线；这场还没采到粉丝发言，所以认不出昵称',
+  };
+  let j = null;
+  try {
+    const res = await fetch(`${WORKER}/api/nb/card?k=${encodeURIComponent(KEY)}`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload), signal: AbortSignal.timeout(20000),
+    });
+    j = await res.json().catch(() => null);
+  } catch (e) { j = null; }
+  if (!j || !j.ok || !j.url) { log('nb 出图：worker 没给链接'); return null; }
+
+  const hhmm = new Date(Date.now() + 8 * 3600e3).toISOString().slice(11, 16);
+  return {
+    name, url: j.url,
+    text: `【${name}·直播间】现在 ${real} 人在看 · 认出 ${peers.length} 位粉丝（云信实时 ${hhmm}）`,
+  };
+}
+
 async function sayImage(chat, url) {
   const u = String(url || '').trim();
   if (!/^https?:\/\//i.test(u)) return false;
@@ -2814,6 +3058,15 @@ function watch() {
 }
 
 if (PING) { await ping(); }
+else if (NB_TEST) {
+  /* 自检：只算数据 + 让云端出图，**不碰微信**（不往群里发任何东西）。
+     用法：node wxbot/agent-wechat-bridge.mjs --nb 王语晨 */
+  let got = null;
+  try { got = await nbCardByName(NB_TEST); } catch (e) { log('nb 自检失败：' + ((e && e.message) || e)); }
+  log('nb 自检「' + NB_TEST + '」→ ' + JSON.stringify(got));
+  console.log('NB ' + JSON.stringify(got));
+  process.exit(got && got.url ? 0 : 2);
+}
 else {
   /* 指令前缀表：启动先拉一次，之后每 5 分钟刷新（内部 TTL 10 分钟，双保险）。
      拉不到就用文件缓存 / 内置默认，绝不影响启动。 */

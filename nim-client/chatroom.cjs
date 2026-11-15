@@ -296,6 +296,8 @@ class NimCommonlinkChatroomClient {
         this.seenMessageIds = new Set();
         this.pendingRequests = new Map();
         this.pendingRoomInfoRequests = new Map();
+        // 通用请求（探协议用）：serial → {resolve,reject,timeout}，响应按 serial 直接回原始 body
+        this.pendingRawRequests = new Map();
     }
 
     async connect() {
@@ -338,6 +340,34 @@ class NimCommonlinkChatroomClient {
                 const pending = this.pendingRoomInfoRequests.get(serial);
                 if (!pending) return;
                 this.pendingRoomInfoRequests.delete(serial);
+                clearTimeout(pending.timeout);
+                reject(error);
+            });
+        });
+    }
+
+    /**
+     * 通用请求：自己指定 serviceId / commandId / body，拿回原始响应（探协议 / 新接口用）
+     * @returns {Promise<{serviceId:number,commandId:number,resultCode:number,body:Buffer}>}
+     */
+    async requestRaw(serviceId, commandId, body = Buffer.alloc(0), timeoutMs = 12_000) {
+        if (!this.connected || !this.socket || this.socket.destroyed || !this.encryptor) {
+            throw new Error('直播聊天室尚未连接');
+        }
+        const serial = this.#nextSerial();
+        const packet = makePacket(serviceId, commandId, serial, body);
+        return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+                this.pendingRawRequests.delete(serial);
+                reject(new Error('请求超时 ' + serviceId + '/' + commandId));
+            }, timeoutMs);
+            timeout.unref?.();
+            this.pendingRawRequests.set(serial, { resolve, reject, timeout });
+            this.socket.write(this.encryptor.apply(packet), (error) => {
+                if (!error) return;
+                const pending = this.pendingRawRequests.get(serial);
+                if (!pending) return;
+                this.pendingRawRequests.delete(serial);
                 clearTimeout(pending.timeout);
                 reject(error);
             });
@@ -492,6 +522,18 @@ class NimCommonlinkChatroomClient {
                         if (response.serviceId === 13 && response.commandId === 13) {
                             this.#handleChatroomInfoResult(response);
                         }
+                        /* 通用请求（requestRaw）的响应：按 serial 命中就交给调用方，body 原样给 */
+                        const rawPending = this.pendingRawRequests.get(response.serial);
+                        if (rawPending) {
+                            this.pendingRawRequests.delete(response.serial);
+                            clearTimeout(rawPending.timeout);
+                            rawPending.resolve({
+                                serviceId: response.serviceId,
+                                commandId: response.commandId,
+                                resultCode: response.resultCode,
+                                body: response.body
+                            });
+                        }
                     }
                 } catch (error) {
                     this.#reportError(error);
@@ -594,6 +636,11 @@ class NimCommonlinkChatroomClient {
             pending.reject(error);
         }
         this.pendingRoomInfoRequests.clear();
+        for (const pending of this.pendingRawRequests.values()) {
+            clearTimeout(pending.timeout);
+            pending.reject(error);
+        }
+        this.pendingRawRequests.clear();
     }
 
     #startHeartbeat() {
