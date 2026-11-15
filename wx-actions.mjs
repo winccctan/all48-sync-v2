@@ -336,6 +336,10 @@ async function tickOne(w, st, lives, first) {
   /* 小房间发言留档（给群指令 `xfj?` 查）：本轮拉到什么就带上什么，随 push 一起交上去 */
   const smOut = [];
   const next = { ...st };
+  /* 🔴 清掉上一轮的错误：`err` 原先只在「本轮有东西要推」时才删（见 push 前的 delete），
+     于是「上次失败、之后一直正常」的成员，游标里会永远挂着一条过期的 `fetch failed`。
+     2026-11-15 排查「王语晨消息丢了」就被这条假象带偏了半天 ⇒ 每轮开头先清。 */
+  delete next.err;
   /* 「她有没有动作」——本轮只要发现开播/下播/新消息/翻牌就算 true。
      这是「上线」判定的唯一依据（口袋48 不公开登录态，只能看动作）。 */
   let active = false;
@@ -423,9 +427,9 @@ async function tickOne(w, st, lives, first) {
         高峰期出现 10 分钟以上空档很正常，10 分钟的窗根本盖不住。
      ⇒ 已跑到过的成员默认回扫 **30 分钟**；首次跑（游标为空）仍只补 10 分钟，
         避免第一次接入把半小时的历史一口气倒进群。窗口被下限抬高时**打日志**，不再无声无息。 */
-  const BACK_MIN = Math.max(1, Number(process.env.WX_SINCE_MIN) || (first ? 10 : 30));
-  const floor = now - BACK_MIN * 60e3;
   const cursor0 = Number(st.roomT) || 0;
+  const BACK_MIN = Math.max(1, Number(process.env.WX_SINCE_MIN) || (cursor0 ? 30 : 10));
+  const floor = now - BACK_MIN * 60e3;
   const since = Math.max(cursor0, floor);
   if (cursor0 && since > cursor0 + 1000) {
     log(`${w.nick}：⚠️ 房间窗口被截断，跳过 ${Math.round((since - cursor0) / 60e3)} 分钟`
