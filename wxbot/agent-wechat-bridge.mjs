@@ -2824,6 +2824,33 @@ function nimAlive() {
   });
 }
 
+/* ── 在播名册上报（2026-11-15）─────────────────────────────────────────
+   站长：「直播数据不实时不行啊」。`zb?` 判「这场是不是还在播」原来只有两个来源：
+     ① Actions 的 live-now（每 5 分钟一轮的 cron）→ 实测一天只跑两三轮，快照能停 1~2 小时；
+     ② 「末笔礼物 10 分钟内」→ 直播里安静 10 分钟就被判成下播。
+   ⇒ 容器是常驻的，这里每 3 分钟拉一次口袋在播列表推给云端（只 id/昵称/开播时间），
+     和人数那条（live:now）分开存，互不影响。一次 getLiveList 就够，成本可忽略。 */
+const ROSTER_EVERY = 3 * 60 * 1000;
+async function liveRosterTick() {
+  try {
+    const ctx = await pocketCtx('王语晨');
+    if (!ctx || !ctx.token) { log('在播名册：没拿到口袋 token'); return; }
+    const l = await pocketPost('/live/api/v1/live/getLiveList', { debug: true, next: '0', record: false }, ctx.token);
+    const raw = (((l || {}).content) || {}).liveList || [];
+    const lives = raw.filter((x) => x && x.liveId).map((x) => ({
+      id: String(x.liveId),
+      nick: String((x.userInfo || {}).nickname || '').slice(0, 40),
+      t0: Number(x.ctime) || 0,
+    }));
+    if (!lives.length) { log('在播名册：列表是空的（口袋没返回），这轮不推'); return; }
+    const r = await fetch(WORKER + '/api/live/roster?k=' + encodeURIComponent(KEY), {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ lives }), signal: AbortSignal.timeout(15000),
+    });
+    if (!r.ok) log('在播名册上报失败 HTTP ' + r.status);
+  } catch (e) { log('在播名册异常：' + String((e && e.message) || e).slice(0, 80)); }
+}
+
 async function nimGuard() {
   if (!existsSync(NIM_RUN)) return;          // 本机跑桥时没有这个路径，直接不启用
   log('守护：长连接每 ' + Math.round(NIM_CHECK / 60e3) + ' 分钟检查一次');
@@ -3310,5 +3337,8 @@ else {
   pump();
   void ctlLoop();
   void nimGuard();     // 长连接看护：每 5 分钟确认进程还在，不在就拉起
+  /* 在播名册：启动先推一次（`zb?` 立即可用），之后每 3 分钟一次 */
+  void liveRosterTick();
+  setInterval(() => { void liveRosterTick(); }, ROSTER_EVERY);
   watch();
 }
