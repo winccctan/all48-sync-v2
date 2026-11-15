@@ -2226,6 +2226,21 @@ function nbParseArr(buf) {
 const nbU8 = (n) => Buffer.from([Number(n) & 0xff]);
 const nbI32 = (n) => { const b = Buffer.alloc(4); b.writeInt32LE(Number(n)); return b; };
 const nbI64 = (n) => { const b = Buffer.alloc(8); b.writeBigInt64LE(BigInt(Math.trunc(Number(n)))); return b; };
+/* StrArray 编码（`13/16 getChatroomMembersInfo` 的参数）：varint 个数 + 每项 (varint 长度 + utf8) */
+const nbVint = (n) => {
+  const a = []; let v = Number(n) >>> 0;
+  do { let x = v & 0x7f; v = Math.floor(v / 128); if (v) x |= 0x80; a.push(x); } while (v);
+  return Buffer.from(a);
+};
+const nbStr = (s) => { const b = Buffer.from(String(s), 'utf8'); return Buffer.concat([nbVint(b.length), b]); };
+
+/** 昵称清洗：云信昵称里常带 emoji / 前后空格 / 零宽字符，卡片字体没有 emoji 会出豆腐块 */
+function nbNick(s) {
+  return String(s == null ? '' : s)
+    .replace(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{FE00}-\u{FE0F}\u{200B}-\u{200F}\u{200D}\u{E0000}-\u{E007F}]/gu, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
 
 /** `nb?名字` 的图片版：**自己判断在不在播**（不依赖云端那份会过期的 live:now 快照），
  *  在播就现查云信算出人数+昵称，交给 worker 出图。
@@ -2248,9 +2263,14 @@ async function nbCardByName(rawName) {
   }
   const hit = lives.find((x) => Number((x.userInfo || {}).uid || 0) === uid)
     || lives.find((x) => String((x.userInfo || {}).nickname || '').replace(/\s+/g, '').endsWith(String(ctx.n).replace(/\s+/g, '')));
-  if (!hit) return { off: true, name: ctx.n };
+  /* 调试：`NB_ROOM=<云信聊天室 id>` 时跳过「在不在播」，直接按这个房间算一遍
+     （没人在播也想验版式 / 验数据时用，线上容器不设这个变量）。 */
+  const forceRoom = String(process.env.NB_ROOM || '').trim();
+  if (!hit && !forceRoom) return { off: true, name: ctx.n };
 
-  const one = (await pocketPost('/live/api/v1/live/getLiveOne', { liveId: String(hit.liveId) }, ctx.token) || {}).content || {};
+  const one = forceRoom
+    ? { roomId: forceRoom }
+    : ((await pocketPost('/live/api/v1/live/getLiveOne', { liveId: String(hit.liveId) }, ctx.token) || {}).content || {});
   const roomId = String(one.roomId || '');
   if (!roomId) { log('nb 出图：getLiveOne 没 roomId'); return null; }
 
@@ -2261,6 +2281,7 @@ async function nbCardByName(rawName) {
 
   const cli = lib.createNimCommonlinkChatroomClient({ appKey: NIM_APPKEY, account: cred.accid, token: cred.pwd, roomId });
   let online = 0, members = [], msgs = [];
+  const nickOf = new Map();          // accid → 昵称
   try {
     await Promise.race([
       cli.connect(),
@@ -2269,16 +2290,43 @@ async function nbCardByName(rawName) {
     const info = await cli.getChatroomInfo();
     online = Number(info && info.onlineMemberNum) || 0;
     members = nbParseArr((await cli.requestRaw(13, 8, Buffer.concat([nbU8(1), nbI64(0), nbI32(100)]))).body);
-    /* 弹幕翻页补昵称：reverse=0 才是「越翻越早」，reverse=1 传游标会原地打转 */
-    let tag = 0;
-    for (let page = 0; page < 8; page++) {
-      const list = nbParseArr((await cli.requestRaw(13, 9, Buffer.concat([nbI64(tag), nbI32(100), nbU8(0), nbU8(0)]))).body);
-      if (!list.length) break;
-      let minTs = Infinity;
-      for (const m of list) { const ts = Number(m[20] || 0); if (ts && ts < minTs) minTs = ts; }
-      msgs = msgs.concat(list);
-      if (!Number.isFinite(minTs) || minTs === tag) break;
-      tag = minTs;
+
+    /* ① 昵称主路：`13/16 getChatroomMembersInfo`（参数 StrArray=accid 数组）直接带成员昵称，
+       键 5 = nick、键 10 = 进房时间 ⇒ **没发过言的人也有名字**，不用再靠弹幕倒推。
+       （2026-11-15 站长：「进房的信息不也行吗」——正是这个，一次 ≤200 个 accid 都收得下。） */
+    const accs = members.map((x) => String(x[2] || '')).filter(Boolean);
+    if (accs.length) {
+      try {
+        const st = await cli.requestRaw(13, 16, Buffer.concat([nbVint(accs.length), ...accs.map(nbStr)]));
+        for (const r of nbParseArr(st.body)) {
+          const a = String(r[2] || ''), nk = nbNick(r[5]);
+          if (a && nk) nickOf.set(a, nk);
+        }
+      } catch (e) { log('nb 出图：13/16 成员资料失败 ' + String((e && e.message) || e).slice(0, 60)); }
+    }
+
+    /* ② 兜底：还有账号没设聊天室昵称（实测确有，键 5 为空）⇒ 用弹幕里的 user.nickName 补。
+       只在真缺名字时才翻，翻 4 页够覆盖一整场的主要发言人。 */
+    const lack = accs.filter((a) => a !== String(cred.accid) && !nickOf.get(a));
+    if (lack.length) {
+      /* reverse=0 才是「越翻越早」，reverse=1 传游标会原地打转 */
+      let tag = 0;
+      for (let page = 0; page < 4 && lack.length; page++) {
+        const list = nbParseArr((await cli.requestRaw(13, 9, Buffer.concat([nbI64(tag), nbI32(100), nbU8(0), nbU8(0)]))).body);
+        if (!list.length) break;
+        let minTs = Infinity;
+        for (const m of list) { const ts = Number(m[20] || 0); if (ts && ts < minTs) minTs = ts; }
+        msgs = msgs.concat(list);
+        if (!Number.isFinite(minTs) || minTs === tag) break;
+        tag = minTs;
+      }
+      for (const m of msgs) {
+        const from = String(m[21] || '');
+        if (!from || nickOf.has(from)) continue;
+        let pl = {}; try { pl = JSON.parse(m[4] || '{}'); } catch { continue; }
+        const nk = nbNick((pl.user || {}).nickName);
+        if (nk) nickOf.set(from, nk);
+      }
     }
   } catch (e) {
     log('nb 出图：云信查询失败 ' + String((e && e.message) || e).slice(0, 80));
@@ -2287,35 +2335,52 @@ async function nbCardByName(rawName) {
     try { cli.destroy(); } catch { /* noop */ }
   }
 
-  /* accid → 昵称 */
-  const nickOf = new Map();
-  for (const m of msgs) {
-    const from = String(m[21] || '');
-    if (!from) continue;
-    let pl = {}; try { pl = JSON.parse(m[4] || '{}'); } catch { continue; }
-    const u = pl.user || {};
-    if (u.nickName) nickOf.set(from, String(u.nickName));
-  }
-  const others = members.filter((x) => String(x[2]) !== String(cred.accid));
+  /* 观众名单：按进房时间倒序（最近进来的排前面），昵称去重；卡片最多列 100 个（再多图太长）
+     🔴 两道过滤：
+       1) 主播自己（直播间成员列表里也有她，例如「SNH48-张倩」）不算观众；
+       2) 我们自己的常驻机器人（昵称 presence-bot，2024-09 建的那个 NIM 号）不算观众，
+          否则每张卡片都会多一个假人。额外可加账号进 NB_SKIP_NICKS / NB_SKIP_ACCS。 */
+  const SKIP_NICKS = new Set(String(process.env.NB_SKIP_NICKS || 'presence-bot')
+    .split(',').map((s) => nbNick(s).toLowerCase()).filter(Boolean));
+  const SKIP_ACCS = new Set(String(process.env.NB_SKIP_ACCS || '').split(',').map((s) => s.trim()).filter(Boolean));
+  const bareNick = (s) => nbNick(s).replace(/^[A-Za-z]{2,4}\d*-/, '').trim();
+  const hostName = nbNick(ctx.n || nm);
+  /* viewers = 真正的观众：去掉我方连接、自家机器人、主播本人 */
+  const viewers = members
+    .filter((x) => String(x[2]) !== String(cred.accid) && !SKIP_ACCS.has(String(x[2])))
+    .filter((x) => {
+      const nk = nickOf.get(String(x[2]));
+      if (!nk) return true;                                    // 没昵称的也留着，卡片会写「认不出」
+      if (SKIP_NICKS.has(nk.toLowerCase())) return false;
+      return bareNick(nk) !== hostName;
+    })
+    .sort((a, b) => (Number(b[10]) || 0) - (Number(a[10]) || 0));
+  const CAP = 100;
   const peers = [];
   const seen = new Set();
-  for (const x of others) {
+  for (const x of viewers.slice(0, CAP)) {
     const nk = nickOf.get(String(x[2]));
     if (!nk || seen.has(nk)) continue;
     seen.add(nk);
     peers.push(nk);
   }
+  const unnamed = viewers.slice(0, CAP).filter((x) => !nickOf.get(String(x[2]))).length;
 
-  const real = Math.max(0, online - 1);   // 减掉机器人这个连接
+  /* 人数要减掉「我们自己」和「她自己」：我方账号 1 个 + 同时在房里的自家机器人（presence-bot）+ 主播本人，
+     否则数字会比卡片上的名单多，看起来像我们少列了人。 */
+  const nickOfAcc = (x) => String(nickOf.get(String(x[2])) || '');
+  const botOnes = members.filter((x) => SKIP_NICKS.has(nickOfAcc(x).toLowerCase())).length;
+  const hostOnes = members.filter((x) => nickOfAcc(x) && bareNick(nickOfAcc(x)) === hostName).length;
+  const real = Math.max(0, online - 1 - botOnes - hostOnes);
   const name = String(ctx.n || nm);
   const t0 = Number(one.ctime) || 0;
   const payload = {
-    name, online: real, total: others.length || real, t0, at: Date.now(),
+    name, online: real, total: viewers.length || real, t0, at: Date.now(),
     heat: Number(one.onlineNum) || 0,
     peers,
-    note: peers.length
-      ? '人数＝云信聊天室实时在线（含只看不说话的）；昵称只能认出最近发过言的粉丝'
-      : '人数＝云信聊天室实时在线；这场还没采到粉丝发言，所以认不出昵称',
+    note: '人数＝云信聊天室实时在线（含只看不说话的）；昵称取自聊天室成员资料'
+      + (unnamed ? '，其中 ' + unnamed + ' 位没设昵称看不出来' : '')
+      + (viewers.length > CAP ? '；名单只列最近进房的 ' + CAP + ' 位' : ''),
   };
   let j = null;
   try {
@@ -2330,7 +2395,9 @@ async function nbCardByName(rawName) {
   const hhmm = new Date(Date.now() + 8 * 3600e3).toISOString().slice(11, 16);
   return {
     name, url: j.url,
-    text: `【${name}·直播间】现在 ${real} 人在看 · 认出 ${peers.length} 位粉丝（云信实时 ${hhmm}）`,
+    text: `【${name}·直播间】现在 ${real} 人在看 · 认出 ${peers.length}`
+      + (viewers.length > peers.length ? '/' + Math.min(viewers.length, 100) : '')
+      + ` 位粉丝（云信实时 ${hhmm}）`,
   };
 }
 

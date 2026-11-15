@@ -80,6 +80,7 @@ async function nimCred() {
 const u8 = (n) => Buffer.from([Number(n) & 0xff]);
 const i32 = (n) => { const b = Buffer.alloc(4); b.writeInt32LE(Number(n)); return b; };
 const i64 = (n) => { const b = Buffer.alloc(8); b.writeBigInt64LE(BigInt(Math.trunc(Number(n)))); return b; };
+const str = (x) => { const b = Buffer.from(String(x), "utf8"); return Buffer.concat([vint(b.length), b]); };
 const vint = (n) => { const a = []; let v = Number(n) >>> 0; do { let x = v & 0x7f; v = Math.floor(v / 128); if (v) x |= 0x80; a.push(x); } while (v); return Buffer.from(a); };
 const rd = (b, o) => { let v = 0, s = 0, x; do { x = b[o++]; v += (x & 0x7f) * Math.pow(2, s); s += 7; } while (x & 0x80); return { v, o }; };
 
@@ -146,25 +147,41 @@ const online = Number(info.onlineMemberNum) || 0;
 /* 1) 成员列表 */
 const members = parseArr((await cli.requestRaw(13, 8, Buffer.concat([u8(1), i64(0), i32(LIMIT)]))).body);
 
-/* 2) 弹幕补昵称：13/9 从最新往前翻（reverse=0 才是「越翻越早」，reverse=1 会原地打转） */
-const PAGES = Number(process.env.MSG_PAGES) || 12;
+/* 2) 昵称主路：13/16 getChatroomMembersInfo（StrArray=accid）→ 键 5 = nick、键 10 = 进房时间
+   🔴 2026-11-15 补：这个命令之前漏了。成员资料里就有昵称，**没发过言的人也有名字**，
+      不必再从弹幕倒推（弹幕只作兜底，给那些没设聊天室昵称的账号补）。 */
+const ACCS = members.map((x) => String(x[2] || '')).filter(Boolean);
 const nickOf = new Map();
-let tag = 0;
-for (let page = 0; page < PAGES; page++) {
-  const list = parseArr((await cli.requestRaw(13, 9, Buffer.concat([i64(tag), i32(100), u8(0), u8(0)]))).body);
-  if (!list.length) break;
-  let minTs = Infinity;
-  for (const m of list) {
-    const ts = Number(m[20] || 0);
-    if (ts && ts < minTs) minTs = ts;
-    const from = String(m[21] || '');
-    if (!from) continue;
-    let pl = {}; try { pl = JSON.parse(m[4] || '{}'); } catch { /* 系统消息 */ }
-    const u = pl.user || {};
-    if (u.nickName) nickOf.set(from, { nick: String(u.nickName), uid: String(u.userId || '') });
+if (ACCS.length) {
+  const r = await cli.requestRaw(13, 16, Buffer.concat([vint(ACCS.length), ...ACCS.map(str)]));
+  for (const x of parseArr(r.body)) {
+    const a = String(x[2] || ''), nk = String(x[5] || '').trim();
+    if (a && nk) nickOf.set(a, nk);
   }
-  if (!Number.isFinite(minTs) || minTs === tag) break;
-  tag = minTs;
+  console.log('13/16 成员资料：' + ACCS.length + ' 个 accid → 有昵称 ' + nickOf.size + ' 个');
+}
+
+/* 3) 兜底：没设昵称的用弹幕里的 user.nickName 补（13/9 从最新往前翻，reverse=0 才是越翻越早） */
+const PAGES = Number(process.env.MSG_PAGES) || 12;
+const lack = ACCS.filter((a) => a !== cred.accid && !nickOf.has(a));
+if (lack.length) {
+  let tag = 0;
+  for (let page = 0; page < PAGES; page++) {
+    const list = parseArr((await cli.requestRaw(13, 9, Buffer.concat([i64(tag), i32(100), u8(0), u8(0)]))).body);
+    if (!list.length) break;
+    let minTs = Infinity;
+    for (const m of list) {
+      const ts = Number(m[20] || 0);
+      if (ts && ts < minTs) minTs = ts;
+      const from = String(m[21] || '');
+      if (!from || nickOf.has(from)) continue;
+      let pl = {}; try { pl = JSON.parse(m[4] || '{}'); } catch { /* 系统消息 */ }
+      const u = pl.user || {};
+      if (u.nickName) nickOf.set(from, String(u.nickName));
+    }
+    if (!Number.isFinite(minTs) || minTs === tag) break;
+    tag = minTs;
+  }
 }
 
 const others = members.filter((x) => String(x[2]) !== cred.accid);
@@ -173,11 +190,11 @@ console.log('聊天室 ' + roomId + ' 在线人数 ' + online + '（含我方账
 console.log('游客列表 ' + members.length + ' 人（去掉自己后 ' + others.length + '），其中能对上昵称的 '
   + others.filter((x) => nickOf.has(String(x[2]))).length + ' 人');
 console.log('---');
-others.forEach((x, i) => {
+others.sort((a,b)=>(Number(b[10])||0)-(Number(a[10])||0)).forEach((x, i) => {
   const acc = String(x[2]);
-  const n = nickOf.get(acc);
+  const nm2 = nickOf.get(acc);
   const t = x[10] ? new Date(Number(x[10])).toLocaleTimeString('zh-CN', { hour12: false }) : '';
-  console.log(String(i + 1).padStart(2) + '. ' + (n ? n.nick : '（未发言·无昵称）') + '  进房 ' + t);
+  console.log(String(i + 1).padStart(2) + '. ' + (nm2 || '（没设昵称）') + '  进房 ' + t);
 });
 cli.destroy();
 process.exit(0);
