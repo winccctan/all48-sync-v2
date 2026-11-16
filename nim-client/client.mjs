@@ -279,7 +279,8 @@ function viewFromNim(d, ext) {
        表情包本身就是内容，取到图就发图，文字只留 `[表情]` 作说明。 */
     case 'EXPRESSIMAGE':
     case 'EXPRESS': {
-      const e = src.expressImgInfo || src.expressInfo || src;
+      /* 两个层级都试：实测样本在 attachment 顶层，但别处见过包在 content 里。 */
+      const e = src.expressImgInfo || att.expressImgInfo || src.expressInfo || att.expressInfo || src;
       const eu = url(s(e.emotionRemote, e.url, e.pic, ''));
       if (eu) o.i = [eu];
       o.x = '[表情]';
