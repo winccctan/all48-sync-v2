@@ -236,6 +236,7 @@ const LABEL = {
   AGENT_QCHAT_GIFT_REPLY: 'AI 对话回复',
   FLIPCARD_AUDIO: '翻牌 · 语音', FLIPCARD_VIDEO: '翻牌 · 视频',
   AUDIO_GIFT_REPLY: '礼物语音回复', VIDEO: '视频', AUDIO: '语音', IMAGE: '图片',
+  EXPRESSIMAGE: '表情', EXPRESS: '表情',
 };
 
 function viewFromNim(d, ext) {
@@ -267,6 +268,21 @@ function viewFromNim(d, ext) {
       const many = Array.isArray(src.imgs) ? src.imgs : Array.isArray(src.images) ? src.images : null;
       o.i = many ? many.map((x) => url(typeof x === 'string' ? x : x?.url)).filter(Boolean) : (one ? [url(one)] : null);
       o.x = body;
+      break;
+    }
+    /* 🔴 表情包（2026-11-16 站长：「14:14 的表情没有读取」）。
+       实测结构（all48-live-sync/probe-express.mjs，王语晨房间 5 条样本一致）：
+         {"expressImgInfo":{"emotionRemote":"https://source.48.cn/.../xxx.png","width":200,"height":200},
+          "messageType":"EXPRESSIMAGE"}
+       图只在 expressImgInfo.emotionRemote 里，顶层没有 url/pic ⇒ 以前落到 default：
+       既拿不到图、又没有正文，最后只推出一行 `[EXPRESSIMAGE]` 字母。
+       表情包本身就是内容，取到图就发图，文字只留 `[表情]` 作说明。 */
+    case 'EXPRESSIMAGE':
+    case 'EXPRESS': {
+      const e = src.expressImgInfo || src.expressInfo || src;
+      const eu = url(s(e.emotionRemote, e.url, e.pic, ''));
+      if (eu) o.i = [eu];
+      o.x = '[表情]';
       break;
     }
     case 'AUDIO': case 'FLIPCARD_AUDIO': case 'AUDIO_GIFT_REPLY':

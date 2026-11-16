@@ -237,6 +237,19 @@ function line(m) {
       img = String(b.url || b.imageUrl || b.picUrl || '');
     } catch { img = ''; }
   }
+  /* 🔴 表情包（2026-11-16 站长截图：14:14 王语晨发表情，群里只有一行 `[EXPRESSIMAGE]`，没图）。
+     真实结构（probe-express.mjs 实测，5 条样本全一致）：
+       {"expressImgInfo":{"emotionRemote":"https://source.48.cn/.../xxx.png","width":200,"height":200},
+        "messageType":"EXPRESSIMAGE"}
+     ⇒ 图在 expressImgInfo.emotionRemote，不是顶层 url/pic。以前落到 else 被整条丢掉（连图都没了）。 */
+  else if (type === 'EXPRESSIMAGE' || type === 'EXPRESS') {
+    content = '[表情]';
+    try {
+      const b = JSON.parse(body);
+      const e = b.expressImgInfo || b.expressInfo || b;
+      img = String(e.emotionRemote || e.url || e.pic || '');
+    } catch { img = ''; }
+  }
   /* 🔴 翻牌（FLIPCARD_AUDIO / FLIPCARD_VIDEO）以前直接落到 else 被丢掉，
      2026-11-12 补上：翻牌是她最主动的动作之一，也是「上线」的重要信号。
      真实文本藏在 bodys 里，字段名三种写法都遇到过 ⇒ 统一交给 pickText 挖。 */
