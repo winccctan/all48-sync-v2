@@ -226,6 +226,8 @@ async function vodFor(uid) {
       let r;
       try {
         r = await fetchLiveListPageMsg48({ userId: uid, next: newestLiveId, record: true });
+        // 🔴 msg48 现在会「成功但空列表」（2026-11-21 实测）——空也要回退官方，否则整场 0 条
+        if (!(r.list || []).length) throw new Error('msg48 empty');
       } catch (e) {
         r = await fetchLiveListPage({ userId: uid, next: newestLiveId, record: true });
       }
@@ -236,7 +238,7 @@ async function vodFor(uid) {
     try {
       const prev = await (await site('/api/vod?id=' + uid)).json();
       for (const o of (prev && Array.isArray(prev.list) ? prev.list : [])) {
-        if (o && o.liveId && o.play) have.set(String(o.liveId), o.play);
+        if (o && o.liveId) have.set(String(o.liveId), { play: o.play || '', msg: o.msg || '' });
       }
     } catch (e) { /* 读不到就当全都没有 */ }
 
@@ -247,18 +249,26 @@ async function vodFor(uid) {
         const i = pi++;
         if (i >= list.length) return;
         const it = list[i];
-        let play = pickPlayable([it.playStreamPath, it.hlsStreamPath, it.streamPath]) || have.get(String(it.liveId)) || '';
-        if (!play) {
+        const got = have.get(String(it.liveId)) || {};
+        let play = pickPlayable([it.playStreamPath, it.hlsStreamPath, it.streamPath]) || got.play || '';
+        // 弹幕 LRC 地址（2026-11-21）：只有 getLiveOne 给，列表项偶尔自带
+        let msg = it.msgFilePath || it.lrcPath || got.msg || '';
+        if (!play || !msg) {
           // 主通道 msg48（海外直连，实测 10/10 成功、0.5s/条，且不限流）；
           // 取不到才回退官方接口（要走国内代理，代理一抖就整批失败）。
-          try {
-            const m = await fetchLiveOneMsg48(it.liveId);
-            play = pickPlayable([m.playStreamPath, m.hlsStreamPath, m.liveStreamPath, m.streamPath]);
-          } catch (e) { /* 回退官方 */ }
+          // 🔴 2026-11-21 实测：msg48 的 getLiveOne **只回播放地址，没有 msgFilePath**
+          //    ⇒ 缺弹幕时先打 msg48 纯属浪费一个来回，只有缺 play 才值得先问它。
           if (!play) {
             try {
+              const m = await fetchLiveOneMsg48(it.liveId);
+              play = pickPlayable([m.playStreamPath, m.hlsStreamPath, m.liveStreamPath, m.streamPath]);
+            } catch (e) { /* 回退官方 */ }
+          }
+          if (!play || !msg) {
+            try {
               const one = await fetchLiveOne(it.liveId);
-              play = pickPlayable([one.playStreamPath, one.hlsStreamPath, one.liveStreamPath, one.streamPath]);
+              if (!play) play = pickPlayable([one.playStreamPath, one.hlsStreamPath, one.liveStreamPath, one.streamPath]);
+              if (!msg) msg = one.msgFilePath || '';
             } catch (e) { /* 单条失败不影响整份 */ }
           }
         }
@@ -268,6 +278,7 @@ async function vodFor(uid) {
           cover: it.coverPath || it.cover || '',
           ctime: Number(it.ctime) || 0,
           play,
+          msg,
         };
       }
     }

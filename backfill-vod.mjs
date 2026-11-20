@@ -36,6 +36,8 @@ const VOD_PLAY = Number(process.env.VOD_PLAY || 999);
 // 故压低并发求稳：人级 6 × 单人内 3 ≈ 18 并发。
 const VOD_PLAY_CONC = Number(process.env.VOD_PLAY_CONC || 3);
 const VOD_KEEP = Number(process.env.VOD_KEEP || 5000);
+// 只要最近 N 场（0 = 全部）。用于「先把全员最近几场铺上弹幕，历史慢慢补」。
+const VOD_RECENT = Number(process.env.VOD_RECENT || 0);
 const CONC = Number(process.env.VOD_CONC || 6);
 const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
@@ -80,6 +82,7 @@ if (!ONLY_UIDS.length && SHARD_N > 1) {
   log(`分片 ${SHARD_I + 1}/${SHARD_N} ⇒ 本批 ${uids.length} 人`);
 }
 log(`回填 ${uids.length} 人`);
+if (VOD_RECENT) log(`⚡ 只补最近 ${VOD_RECENT} 场（历史留待后续慢跑）`);
 
 /* ---------- 全团最新 liveId：按成员翻页的 next 起点（不能是 0） ----------
    🔴 必须容错重试：实测代理会偶发「CONNECT 502」，这一步抛错会让整个回填
@@ -103,6 +106,7 @@ log('翻页起点 liveId=' + newestLiveId);
 /* ---------- 并发抓 ---------- */
 let cursor = 0, done = 0, has = 0, batch = [];
 let playN = 0, listN = 0;   // 累计：有播放地址的场数 / 总场数（验收「是否场场可点播」）
+let msgN = 0;               // 累计：有弹幕文件（LRC）的场数
 let viaMsg48 = 0, viaPocket = 0;   // 两条取址通道各自贡献多少（判断主通道是否健康）
 let oldestTs = 0, oldestUid = 0;   // 全批最老的一场（验收是否翻到历史尽头）
 const dstr = (ts) => new Date(Number(ts)).toISOString().slice(0, 10);
@@ -140,6 +144,9 @@ async function worker() {
         let r;
         try {
           r = await fetchLiveListPageMsg48({ userId: uid, next, record: true });
+          // 🔴 2026-11-21：msg48 现在会「成功返回但列表为空」（上游改了），
+          //    只按 throw 回退的话会直接判定「没有录播」，整批 0 场。空也算失败。
+          if (!(r.list || []).length) throw new Error('msg48 empty');
         } catch (e) {
           try {
             r = await fetchLiveListPage({ userId: uid, next, record: true });
@@ -157,6 +164,8 @@ async function worker() {
           added++;
         }
         pages++;
+        // 只补最近 N 场：够数就收工，别再往下翻历史（省一大半请求）
+        if (VOD_RECENT && raw.length >= VOD_RECENT) break;
         if (!cur.length) {
           // 空页：拿已翻到的最后一条 liveId 再探一次，仍空才认定到底
           if (emptyRetry || !raw.length) break;
@@ -173,7 +182,7 @@ async function worker() {
         next = nx !== '0' ? nx : lastId;
         if (raw.length >= VOD_KEEP) break;
       }
-      const list = raw.slice(0, VOD_KEEP);
+      const list = raw.slice(0, VOD_RECENT || VOD_KEEP);
       if (list.length) {
         // 库里已经有地址的场次**不再取第二遍**：重跑时只补漏（上一轮失败的那批），
         // 否则同一批 60 场每轮都要重新打 60 次接口，既慢又容易把代理再打挂。
@@ -181,7 +190,7 @@ async function worker() {
         try {
           const prev = await (await site('/api/vod?id=' + uid)).json();
           for (const o of (prev && Array.isArray(prev.list) ? prev.list : [])) {
-            if (o && o.liveId && o.play) have.set(String(o.liveId), o.play);
+            if (o && o.liveId) have.set(String(o.liveId), { play: o.play || '', msg: o.msg || '' });
           }
         } catch (e) { /* 读不到就当全都没有 */ }
 
@@ -192,30 +201,39 @@ async function worker() {
             const k = pi++;
             if (k >= list.length) return;
             const it = list[k];
-            let play = pickPlayable([it.playStreamPath, it.hlsStreamPath, it.streamPath]) ||
-              have.get(String(it.liveId)) || '';
-            if (!play && k < VOD_PLAY) {
-              // 主通道 msg48（海外直连，稳定、快）：实测并发下也不限流。
-              // 失败才回退官方接口（走国内代理）——它是保底，别当成主力。
-              try {
-                const m = await fetchLiveOneMsg48(it.liveId);
-                play = pickPlayable([m.playStreamPath, m.hlsStreamPath, m.liveStreamPath, m.streamPath]);
-                if (play) viaMsg48++;
-              } catch (e) { /* 落到下面的官方通道 */ }
+            const got = have.get(String(it.liveId)) || {};
+            let play = pickPlayable([it.playStreamPath, it.hlsStreamPath, it.streamPath]) || got.play || '';
+            // 弹幕（2026-11-21）：录播的 LRC 弹幕文件地址**只有 getLiveOne 给**，
+            // 列表项偶尔自带 msgFilePath，有就直接用，没有就顺带要一次（同一个请求里拿两样）。
+            let msg = it.msgFilePath || it.lrcPath || got.msg || '';
+            if ((!play || !msg) && k < VOD_PLAY) {
+              // 🔴 2026-11-21 实测：msg48 的 getLiveOne **只回播放地址，没有 msgFilePath**
+              //    （keys = playStreamPath/hlsStreamPath/liveStreamPath/streamPath/rtmpPath/title/ctime）。
+              //    所以「缺弹幕」时先打 msg48 是纯浪费一个来回（约 1.5s/场），只有缺 play 才值得先问它。
               if (!play) {
                 try {
+                  const m = await fetchLiveOneMsg48(it.liveId);
+                  play = pickPlayable([m.playStreamPath, m.hlsStreamPath, m.liveStreamPath, m.streamPath]);
+                  if (play) viaMsg48++;
+                } catch (e) { /* 落到下面的官方通道 */ }
+              }
+              if (!play || !msg) {
+                try {
                   const one = await fetchLiveOne(it.liveId);
-                  play = pickPlayable([one.playStreamPath, one.hlsStreamPath, one.liveStreamPath, one.streamPath, one.rtmpPath]);
+                  if (!play) play = pickPlayable([one.playStreamPath, one.hlsStreamPath, one.liveStreamPath, one.streamPath, one.rtmpPath]);
+                  if (!msg) msg = one.msgFilePath || '';
                   if (play) viaPocket++;
                 } catch (e) { /* 两条路都没取到，留空下轮再补 */ }
               }
             }
+            if (msg) msgN++;
             out[k] = {
               liveId: String(it.liveId),
               title: it.title || '',
               cover: it.coverPath || it.cover || '',
               ctime: Number(it.ctime) || 0,
               play,
+              msg,
             };
           }
         }
@@ -236,11 +254,11 @@ async function worker() {
       // 单个人失败不影响整体
     }
     done++;
-    if (done % 50 === 0) log(`进度 ${done}/${uids.length} · 有录播 ${has} 人 · ${listN} 场中 ${playN} 场可播 · ${((Date.now() - t0) / 1000).toFixed(0)}s`);
+    if (done % 50 === 0) log(`进度 ${done}/${uids.length} · 有录播 ${has} 人 · ${listN} 场中 ${playN} 场可播/${msgN} 场有弹幕 · ${((Date.now() - t0) / 1000).toFixed(0)}s`);
     await flush(false);
   }
 }
 
 await Promise.all(Array.from({ length: Math.min(CONC, uids.length) }, worker));
 await flush(true);
-log(`完成：${uids.length} 人中 ${has} 人有录播 · ${listN} 场中 ${playN} 场可播（${((playN / Math.max(listN, 1)) * 100).toFixed(0)}%）· 取址来源 msg48 ${viaMsg48} / 官方 ${viaPocket} · 人均 ${(listN / Math.max(has, 1)).toFixed(0)} 场 · 最老 ${oldestTs ? dstr(oldestTs) + '（uid ' + oldestUid + '）' : '无'} · 耗时 ${((Date.now() - t0) / 1000 / 60).toFixed(1)} 分钟`);
+log(`完成：${uids.length} 人中 ${has} 人有录播 · ${listN} 场中 ${playN} 场可播 · ${msgN} 场有弹幕（${((playN / Math.max(listN, 1)) * 100).toFixed(0)}%）· 取址来源 msg48 ${viaMsg48} / 官方 ${viaPocket} · 人均 ${(listN / Math.max(has, 1)).toFixed(0)} 场 · 最老 ${oldestTs ? dstr(oldestTs) + '（uid ' + oldestUid + '）' : '无'} · 耗时 ${((Date.now() - t0) / 1000 / 60).toFixed(1)} 分钟`);
