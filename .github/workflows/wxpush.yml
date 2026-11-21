@@ -17,9 +17,11 @@
 name: 微信推送 · 王语晨
 
 on:
-  schedule:
-    # 每 5 分钟一次（GitHub 最小粒度）；job 内自己跑 4.5 分钟补足覆盖
-    - cron: '*/5 * * * *'
+  # 🔴 2026-11-21：微信推送已迁到微信桥常驻容器（/app/sched/run.mjs），
+  #    容器每 5 分钟推一次；这里若留 schedule 会同群双推，故停用定时。
+  #    只保留 workflow_dispatch 供手动急救。worker 侧的 tickWx 拨号也已注释。
+  # schedule:
+  #   - cron: '*/5 * * * *'
   workflow_dispatch:
     inputs:
       run_seconds:
