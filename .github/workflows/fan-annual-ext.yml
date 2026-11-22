@@ -1,0 +1,53 @@
+# 粉丝年报 · 深度抓取（直播回放弹幕 + msg48 三源合并）
+#
+# 为什么需要这条：
+#   口袋 API（pocketapi.48.cn）对 Cloudflare 出口一律 403 ⇒ Worker 自己拿不到直播清单和回放地址。
+#   粉丝年报要算「这个人全年送了多少」，房间 IM 只有公屏礼物、GIFTREPLY 只覆盖开了自动感谢的成员，
+#   缺口最大的一块是**直播间礼物**——它只存在于每场直播的回放弹幕（.lrc）里，必须逐场下载解析。
+#
+# 做法：
+#   tools/fan-annual-ext.mjs 自动完成
+#     ① 按粉丝 uid 拉 msg48 全部记录 → 得到他的历史昵称集合 + 出现过/送过礼的成员
+#     ② 按成员 uid 拉 GIFTREPLY 感谢消息（补 1–6 月）
+#     ③ 逐场下载回放弹幕，抽「昵称 送给 成员 N个礼物」
+#     ④ 三源跨源去重 → POST 回 Worker `/api/fanannual/ext/ingest` 落 R2 `fanlive:data:<uid>`
+#
+# 触发：
+#   · all48 后台「深度抓取」按钮 → Worker 用 GH_TICK_TOKEN 派发（带 inputs）
+#   · 本机等价：node tools/fan-annual-ext.mjs <uid> 2026 --post
+name: 粉丝年报 · 深度抓取
+
+on:
+  workflow_dispatch:
+    inputs:
+      uid:
+        description: '粉丝 uid'
+        required: true
+      year:
+        description: '年份'
+        required: false
+        default: '2026'
+
+permissions:
+  contents: read
+
+concurrency:
+  # 同一个人的重复派发排队即可；不同人不互相挡
+  group: fan-annual-ext-${{ github.event.inputs.uid }}
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: 三源合并并回传
+        env:
+          POCKET48_TOKEN: ${{ secrets.POCKET48_TOKEN }}
+          INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
+        run: |
+          node tools/fan-annual-ext.mjs "${{ github.event.inputs.uid }}" "${{ github.event.inputs.year }}" --post
