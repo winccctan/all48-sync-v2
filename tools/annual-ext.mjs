@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 /**
- * 成员年报「外部数据」生成器 —— 直播场次 + 逐场送礼榜 + 公演场次
+ * 成员年报「外部数据」生成器 —— 直播场次 + 逐场送礼榜 + 直播礼物明细 + 公演场次
  *
  * 为什么不在 Worker 里抓：口袋 API（pocketapi.48.cn）对 Cloudflare 出口返回 403，
- * 和 push-watch 必须跑 Actions 是同一个坑。所以这两块必须在这里（本机 / Actions）抓，
+ * 和 push-watch 必须跑 Actions 是同一个坑。所以这几块必须在这里（本机 / Actions）抓，
  * 生成 JSON 推到 R2 的 `annual:ext:<uid>:<year>`，Worker 的 /api/annual/gen 只做聚合。
  *
  * 用法：
@@ -22,7 +22,7 @@ const YEAR = Number(process.argv[3] || new Date().getUTCFullYear());
 const PUT = process.argv.includes('--put');
 const POST = process.argv.includes('--post');
 if (!/^\d{6,15}$/.test(UID)) {
-  console.error('用法：node tools/annual-ext.mjs <uid> <year> [--put]');
+  console.error('用法：node tools/annual-ext.mjs <uid> <year> [--put|--post]');
   process.exit(1);
 }
 
@@ -146,6 +146,53 @@ for (let p = 0; p < 80; p++) {
   await sleep(150);
 }
 
+// ---------- 3b. 直播礼物明细（回放弹幕 .lrc） ----------
+// 🔴 直播送礼不走房间 IM，房间礼物原文里根本没有；但每场直播结束后的回放弹幕
+//   （getLiveOne → msgFilePath 的 .lrc）里有一行一条的「昵称 \t 送给GNZ48-某某 1个XX」。
+//   年报的「礼物种类」要含直播间，只能从这里补（站长 2026-11-23 要求）。
+//   只取件数，不取金额 —— 金额已经由上面的逐场送礼榜给过，再加会双算。
+const lgKinds = new Map();     // 礼物名 -> 件数
+const lgPeople = new Map();    // 昵称 -> 件数
+let lgSess = 0, lgPieces = 0;
+{
+  let cur2 = 0, lgDone = 0;
+  const worker2 = async () => {
+    while (cur2 < lives.length) {
+      const lv = lives[cur2++];
+      const c = await post('/live/api/v1/live/getLiveOne', { liveId: lv.id }, 2);
+      const fp = c && c.msgFilePath;
+      if (fp) {
+        const url = /^https?:/.test(fp) ? fp : 'https://' + String(fp).replace(/^\/+/, '');
+        let txt = '';
+        try {
+          const r = await fetch(url, { headers: { 'user-agent': UA }, signal: AbortSignal.timeout(20000) });
+          if (r.ok) txt = await r.text();
+        } catch (e) { txt = ''; }
+        if (txt) {
+          let hit = false;
+          for (const line of txt.split('\n')) {
+            // 形如：[00:16:27.174]zZ🐾\t送给GNZ48-陈淑钰 1个灵犀花灯
+            const m = /^\[(\d+):(\d+):(\d+(?:\.\d+)?)\]([^\t]+)\t送给\S*\s*(\d+)个(.+?)\s*$/.exec(line.trim());
+            if (!m) continue;
+            const nick = m[4].trim();
+            const num = Math.min(999, Math.max(1, Number(m[5]) || 1));
+            const name = m[6].trim();
+            if (!nick || !name) continue;
+            hit = true;
+            lgKinds.set(name, (lgKinds.get(name) || 0) + num);
+            lgPeople.set(nick, (lgPeople.get(nick) || 0) + num);
+            lgPieces += num;
+          }
+          if (hit) lgSess++;
+        }
+      }
+      if (++lgDone % 20 === 0) process.stderr.write(`  回放 ${lgDone}/${lives.length}\n`);
+    }
+  };
+  await Promise.all(Array.from({ length: 6 }, worker2));
+}
+process.stderr.write(`直播礼物 ${lgPieces} 件 / ${lgKinds.size} 种 / 有送礼 ${lgSess} 场\n`);
+
 const byMonth = (arr, key) => {
   const o = {};
   for (let m = 1; m <= 12; m++) o[`${YEAR}-${String(m).padStart(2, '0')}`] = 0;
@@ -167,6 +214,12 @@ const out = {
     ranks: rankYear,
   },
   perf: { total: perfYear.length, byMonth: byMonth(perfYear, 'st') },
+  // 直播间礼物（回放弹幕解析）：只有件数，金额在 ranks 里
+  lg: {
+    pieces: lgPieces, sess: lgSess,
+    kinds: Object.fromEntries([...lgKinds.entries()].sort((a, b) => b[1] - a[1]).slice(0, 200)),
+    people: Object.fromEntries([...lgPeople.entries()].sort((a, b) => b[1] - a[1]).slice(0, 300)),
+  },
 };
 
 const real = rankYear.filter((x) => x.u !== '0').reduce((a, x) => a + x.m, 0);
