@@ -1,0 +1,49 @@
+# 成员年报 · 直播场次 / 逐场送礼榜 / 公演场次
+#
+# 为什么必须有这条：
+#   口袋 API（pocketapi.48.cn）对 Cloudflare 出口一律 403，所以 Worker 自己抓不到直播清单、
+#   逐场送礼榜和公演卡。这几块只能在能直连的机器上抓（本机或 GitHub runner），
+#   结果推回 Worker 存 R2 `annual:ext:<uid>:<year>`。
+#
+# 触发：
+#   · all48 后台「补抓直播数据并生成」按钮 → Worker 用 GH_TICK_TOKEN 派发（带 inputs）
+#   · 本机等价命令：node tools/annual-ext.mjs <uid> <year> --put
+#
+# 回传走 Worker `/api/annual/ext/ingest`（x-ingest-token = 仓库 secret INGEST_TOKEN），
+# 不需要在 GitHub 配 R2 凭据。
+name: 成员年报 · 直播/公演数据
+
+on:
+  workflow_dispatch:
+    inputs:
+      uid:
+        description: '成员 uid'
+        required: true
+      year:
+        description: '年份'
+        required: false
+        default: '2026'
+
+permissions:
+  contents: read
+
+concurrency:
+  # 同一个人的重复派发排队即可；不同人不互相挡
+  group: annual-ext-${{ github.event.inputs.uid }}
+  cancel-in-progress: false
+
+jobs:
+  ext:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: 抓取并回写
+        env:
+          POCKET48_TOKEN: ${{ secrets.POCKET48_TOKEN }}
+          INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
+        run: |
+          node tools/annual-ext.mjs "${{ github.event.inputs.uid }}" "${{ github.event.inputs.year }}" --post
