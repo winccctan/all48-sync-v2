@@ -326,14 +326,27 @@ let MEMBER_UIDS = null;
  *  extInfo.user.userId 就是口袋 uid（实测 182452624 这种）。 */
 async function loadMemberUids() {
   if (MEMBER_UIDS) return MEMBER_UIDS;
+  /* 🔴 2026-11-24 修：all48.wyc0518.cc 在容器内被 Cloudflare Bot Fight 挡成 403，
+     名册永远加载失败 ⇒ 成员过滤整层失效，粉丝闲聊全进群。
+     改走 workers.dev 同源名册（容器内实测 200 / 104KB / 541 人）。 */
+  let t = '';
   try {
-    const r = await fetch('https://all48.wyc0518.cc/data/members.js', { signal: AbortSignal.timeout(15000) });
-    const t = await r.text();
-    const arr = JSON.parse(t.slice(t.indexOf('['), t.lastIndexOf(']') + 1));
-    MEMBER_UIDS = new Set(arr.map((m) => String((m && m.id) || '').trim()).filter(Boolean));
+    const r = await fetch(WORKER + '/data/members.js?v=' + Date.now(), { signal: AbortSignal.timeout(15000) });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    t = await r.text();
   } catch (e) {
-    log('名册加载失败（小房间将只按房主过滤）：' + String((e && e.message) || e).slice(0, 60));
-    MEMBER_UIDS = new Set();
+    log('名册 workers.dev 取失败：' + String((e && e.message) || e).slice(0, 60));
+  }
+  if (t) {
+    try {
+      const arr = JSON.parse(t.slice(t.indexOf('['), t.lastIndexOf(']') + 1));
+      MEMBER_UIDS = new Set(arr.map((m) => String((m && m.id) || '').trim()).filter(Boolean));
+    } catch (e) { log('名册解析失败：' + String((e && e.message) || e).slice(0, 60)); }
+  }
+  /* 兜底：拿不到名册也不能放行全部（粉丝闲聊会进群）⇒ 用关注名单房主 uid 作最小集。 */
+  if (!MEMBER_UIDS || !MEMBER_UIDS.size) {
+    MEMBER_UIDS = new Set(WATCHES.map((w) => String(w.uid)).filter(Boolean));
+    log('名册降级为关注房主 ' + MEMBER_UIDS.size + ' 人');
   }
   log('名册 ' + MEMBER_UIDS.size + ' 人');
   return MEMBER_UIDS;
