@@ -306,6 +306,25 @@ function line(m) {
   return { t: Number(m.msgTime) || 0, text: content, img, voice, by };
 }
 
+/** 全团成员名集合（541 人）——小房间用 list/all 时能拿到所有人的发言，
+ *  我们只要「成员说的」（她自己 + 来串门的成员），粉丝闲聊一律丢弃。
+ *  站长 2026-11-24 口径：「不是要抓里面的人的发言，是成员在他小房间的发言」。 */
+let MEMBER_NAMES = null;
+async function loadMemberNames() {
+  if (MEMBER_NAMES) return MEMBER_NAMES;
+  try {
+    const r = await fetch('https://all48.wyc0518.cc/data/members.js', { signal: AbortSignal.timeout(15000) });
+    const t = await r.text();
+    const arr = JSON.parse(t.slice(t.indexOf('['), t.lastIndexOf(']') + 1));
+    MEMBER_NAMES = new Set(arr.map((m) => String((m && m.n) || '').trim()).filter(Boolean));
+  } catch (e) {
+    log('名册加载失败（小房间将只按房主过滤）：' + String((e && e.message) || e).slice(0, 60));
+    MEMBER_NAMES = new Set();
+  }
+  log('名册 ' + MEMBER_NAMES.size + ' 人');
+  return MEMBER_NAMES;
+}
+
 /** 取 since 之后本人发的消息（最多往回翻 6 页，避免 runner 时间被吃光）
  *  ch 省略 = 大房间；给了 ch 就拉那个频道（小房间用）。 */
 async function collect(since, w, ch, scope) {
@@ -532,7 +551,11 @@ async function tickOne(w, st, lives, first) {
       const s0 = Math.max(Number(st[key]) || 0, floor);
       /* 🔴 小房间必须用 scope='all'：homeowner 只给「房主相关」的消息（她自己的 + 回她的），
          别人的闲聊全看不到（2026-11-23 站长截图：卡密伞麻在她小房间的发言抓不到）。 */
-      const msgs = await collect(s0, w, sc.ch, 'all');
+      /* 🔴 小房间必须用 scope='all'：homeowner 只给「房主相关」的消息，别的成员来串门说的话全看不到。
+         但 all 会连粉丝闲聊一起带回来 ⇒ 按名册过滤，只留成员的发言。 */
+      const allMsgs = await collect(s0, w, sc.ch, 'all');
+      const MEM = await loadMemberNames();
+      const msgs = MEM.size ? allMsgs.filter((x) => !x.by || MEM.has(String(x.by).trim())) : allMsgs;
       if (msgs.length) {
         const newest = msgs[msgs.length - 1].t;
         const label = `【${w.nick}·小房间】`;
