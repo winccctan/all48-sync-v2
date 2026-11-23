@@ -214,10 +214,15 @@ function pickText(raw) {
 }
 
 /** 一条 IM 消息 → {t,text} ；返回 null 表示不推 */
-function line(m) {
+function line(m, allowOthers) {
   let ext = {};
   try { ext = typeof m.extInfo === 'string' ? JSON.parse(m.extInfo) : (m.extInfo || {}); } catch { ext = {}; }
-  if (String(ext.channelRole) !== '2') return null;        // 不是她本人
+  /* channelRole=2 是房主本人，0 是普通成员/访客。
+     🔴 大房间只推她自己（别人的话不进群）；小房间要 allowOthers：
+        站长 2026-11-24「曾昕妍在曾雨思的发言就要抓到」——她的发言 channelRole 是 0，
+        以前在这里就被 return null 整条丢了，后面的 uid 过滤根本没机会执行。 */
+  const isOwner = String(ext.channelRole) === '2';
+  if (!isOwner && !allowOthers) return null;
   const type = String(m.msgType || '');
   if (type === 'LIVEPUSH' || type === 'GIFT') return null;  // 开播另管 / 礼物不推
 
@@ -272,8 +277,14 @@ function line(m) {
       voice = String(info.voiceUrl || '');
     } else {
       const txt = (ans || pickText(body) || q).slice(0, 120);
-      content = '[翻牌]' + (txt ? ' ' + txt : '');
-      if (txt && q && q !== txt) content += '（问：' + q.slice(0, 60) + '）';
+      if (allowOthers) {
+        /* 小房间里的 REPLY 是成员之间的引用回复，不是付费翻牌 ⇒ 不带 [翻牌] 前缀 */
+        content = txt;
+        if (txt && q && q !== txt) content += '（引：' + q.slice(0, 50) + '）';
+      } else {
+        content = '[翻牌]' + (txt ? ' ' + txt : '');
+        if (txt && q && q !== txt) content += '（问：' + q.slice(0, 60) + '）';
+      }
     }
   }
   else if (type === 'AUDIO' || type === 'VOICE') {
@@ -330,7 +341,7 @@ async function loadMemberUids() {
 
 /** 取 since 之后本人发的消息（最多往回翻 6 页，避免 runner 时间被吃光）
  *  ch 省略 = 大房间；给了 ch 就拉那个频道（小房间用）。 */
-async function collect(since, w, ch, scope) {
+async function collect(since, w, ch, scope, allowOthers) {
   const out = [];
   let nextTime = 0;
   for (let p = 0; p < 6; p++) {
@@ -339,7 +350,7 @@ async function collect(since, w, ch, scope) {
     if (!msgs.length) break;
     let oldest = Infinity;
     for (const m of msgs) {
-      const it = line(m);
+      const it = line(m, allowOthers);
       const t = Number(m.msgTime) || 0;
       if (t && t < oldest) oldest = t;
       if (!it) continue;
@@ -556,7 +567,7 @@ async function tickOne(w, st, lives, first) {
          别人的闲聊全看不到（2026-11-23 站长截图：卡密伞麻在她小房间的发言抓不到）。 */
       /* 🔴 小房间必须用 scope='all'：homeowner 只给「房主相关」的消息，别的成员来串门说的话全看不到。
          但 all 会连粉丝闲聊一起带回来 ⇒ 按名册过滤，只留成员的发言。 */
-      const allMsgs = await collect(s0, w, sc.ch, 'all');
+      const allMsgs = await collect(s0, w, sc.ch, 'all', true);
       const MEM = await loadMemberUids();
       /* 没有发送者 uid 的（房主自己发的常常没有 user 字段）保留；有 uid 就按名册判 */
       const msgs = MEM.size ? allMsgs.filter((x) => !x.bu || MEM.has(String(x.bu))) : allMsgs;
