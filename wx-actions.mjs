@@ -277,23 +277,42 @@ function line(m) {
     }
   }
   else if (type === 'AUDIO' || type === 'VOICE') {
-    let sec = 0;
-    try { sec = Number(JSON.parse(body).duration) || 0; } catch { }
+    /* 🔴 2026-11-22 修（站长：「语音没有识别和发出原语音啊」）。
+       以前这里只吐一个 `[语音]` 标签，**音频地址根本没带出去** ⇒ 群里既没转写也没原声，
+       这条消息等于丢了。与 NIM 侧 lib/view.mjs 的 AUDIO 分支对齐：
+       取音频直链放进 voice，交给下面的 asrOf() 转文字；转不出来桥再用 --voice 发原声。 */
+    let b = {};
+    try { b = JSON.parse(body) || {}; } catch { b = {}; }
+    const sec = Number(b.duration || b.audioLength || b.length) || 0;
     content = '[语音' + (sec ? ' ' + Math.round(sec / 1000) + '秒' : '') + ']';
+    const u = String(b.url || b.voiceUrl || b.audioUrl || b.voicePath || b.path || '').trim();
+    /* 相对路径补全域名（口袋有些语音只给 /xx.aac），绝对地址原样用 */
+    if (u) {
+      if (/^https?:\/\//i.test(u)) voice = u;
+      else if (/^\/\//.test(u)) voice = 'https:' + u;
+      else if (/\.(aac|mp3|m4a|wav)(\?|$)/i.test(u)) voice = 'https://mp4.48.cn' + (u.charAt(0) === '/' ? u : '/' + u);
+    }
   } else if (type === 'EXPRESSION' || type === 'EMOJI') content = '[表情]';
   else return null;
 
   if (!content) return null;
-  return { t: Number(m.msgTime) || 0, text: content, img, voice };
+  /* 发送者昵称：小房间用 list/all 时会有别人的发言，必须记下是谁说的
+     （extInfo.user.nickName；房主自己发的也可能没有 user 字段）。 */
+  let by = '';
+  try {
+    const ex = typeof m.extInfo === 'string' ? JSON.parse(m.extInfo) : (m.extInfo || {});
+    by = String((ex && ex.user && ex.user.nickName) || '').trim();
+  } catch (e) { /* ignore */ }
+  return { t: Number(m.msgTime) || 0, text: content, img, voice, by };
 }
 
 /** 取 since 之后本人发的消息（最多往回翻 6 页，避免 runner 时间被吃光）
  *  ch 省略 = 大房间；给了 ch 就拉那个频道（小房间用）。 */
-async function collect(since, w, ch) {
+async function collect(since, w, ch, scope) {
   const out = [];
   let nextTime = 0;
   for (let p = 0; p < 6; p++) {
-    const r = await fetchMessagePage({ serverId: w.srv, channelId: ch || w.ch, nextTime, limit: 50, token: TOKEN });
+    const r = await fetchMessagePage({ serverId: w.srv, channelId: ch || w.ch, nextTime, limit: 50, token: TOKEN, scope: scope || 'homeowner' });
     const msgs = (r && r.messages) || [];
     if (!msgs.length) break;
     let oldest = Infinity;
@@ -473,8 +492,13 @@ async function tickOne(w, st, lives, first) {
         let tx = it.text;
         let voice = '';
         if (it.voice) {
-          if (asrTxt[idx]) tx = tx + '\n🎙 ' + asrTxt[idx];
-          else voice = it.voice;
+          if (asrTxt[idx]) {
+            /* 纯语音消息（text 只有 `[语音]`/`[语音 8秒]`）转写成功后直接换成文字，
+               别再留一个空标签；带正文的（语音翻牌）才追加一行。 */
+            tx = /^\[语音[^\]]*\]$/.test(String(tx || '').trim())
+              ? '🎙 ' + asrTxt[idx]
+              : tx + '\n🎙 ' + asrTxt[idx];
+          } else voice = it.voice;
         }
         add('room:' + w.uid + ':' + it.t, it.t,
           `【${w.nick}·口袋房间】${bjTime(it.t)}\n${tx}`, '', voice);
@@ -506,14 +530,16 @@ async function tickOne(w, st, lives, first) {
     for (const sc of scs) {
       const key = 'sm' + sc.ch;
       const s0 = Math.max(Number(st[key]) || 0, floor);
-      const msgs = await collect(s0, w, sc.ch);
+      /* 🔴 小房间必须用 scope='all'：homeowner 只给「房主相关」的消息（她自己的 + 回她的），
+         别人的闲聊全看不到（2026-11-23 站长截图：卡密伞麻在她小房间的发言抓不到）。 */
+      const msgs = await collect(s0, w, sc.ch, 'all');
       if (msgs.length) {
         const newest = msgs[msgs.length - 1].t;
         const label = `【${w.nick}·小房间】`;
         /* 小房间同样逐条发（理由同 ②：不再合并成一坨「N 条新消息」） */
         for (const it of msgs) {
           add('small:' + w.uid + ':' + sc.ch + ':' + it.t, it.t,
-            `${label}${bjTime(it.t)}\n${it.text}`);
+            `${label}${bjTime(it.t)}${it.by ? ' ' + it.by : ''}\n${it.text}`);
         }
         next[key] = newest;
         active = true;
@@ -529,6 +555,7 @@ async function tickOne(w, st, lives, first) {
            只留 `[图片]` 两个字，`xfj?` 查历史时就没图可发 —— 存档里必须存 url。 */
         for (const it of msgs) {
           const rec = { t: it.t, x: String(it.text || '').slice(0, 300), c: sc.ch, cn: String(sc.name || '').slice(0, 20) };
+          if (it.by) rec.by = String(it.by).slice(0, 40);
           if (it.img) rec.img = String(it.img).slice(0, 300);
           smOut.push(rec);
         }
