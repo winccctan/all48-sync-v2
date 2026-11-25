@@ -32,7 +32,7 @@ const ROOT = resolve(__dirname, '..');
 const UID = String(process.argv[2] || '').trim();
 const YEAR = Number(process.argv.slice(3).find((a) => /^\d{4}$/.test(a)) || 2026);
 const POST = process.argv.includes('--post');
-if (!/^\d{6,15}$/.test(UID)) {
+if (!/^\d{1,20}$/.test(UID)) {
   console.error('用法：node tools/fan-annual-ext.mjs <uid> [year] [--post]');
   process.exit(1);
 }
