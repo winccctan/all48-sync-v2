@@ -56,11 +56,13 @@ function dayStr(ms) {
   return d.getUTCFullYear() + '-' + String(d.getUTCMonth() + 1).padStart(2, '0') + '-' + String(d.getUTCDate()).padStart(2, '0');
 }
 const SINCE_DAY = process.env.LG_SINCE || dayStr(Date.now() - 3 * 86400000);
-const SINCE = Date.parse(SINCE_DAY + 'T00:00:00+08:00');
+// 🔴 LG_SINCE 只接受 YYYY-MM-DD；传了完整 ISO 会拼成 ...T00:00:00+08:00T00:00:00+08:00 ⇒ NaN
+// ⇒ 「SINCE 之后 0 场」整个回补空转（2026-11-25 连踩两次）。这里兼容两种写法。
+const SINCE = Date.parse(/^\d{4}-\d{2}-\d{2}$/.test(SINCE_DAY) ? SINCE_DAY + 'T00:00:00+08:00' : SINCE_DAY);
 /* 回补历史时按「时间窗口」切片用：只扫 UNTIL 之前开的场（默认不限）。
    与 LG_SINCE 配对成一个月的窗口，多个 job 并行互不重叠。 */
 const UNTIL_DAY = process.env.LG_UNTIL || '';
-const UNTIL = UNTIL_DAY ? Date.parse(UNTIL_DAY + 'T00:00:00+08:00') + 86400000 : Infinity;
+const UNTIL = UNTIL_DAY ? Date.parse(/^\d{4}-\d{2}-\d{2}$/.test(UNTIL_DAY) ? UNTIL_DAY + 'T00:00:00+08:00' : UNTIL_DAY) + 86400000 : Infinity;
 
 /* ---------- ① 站点配置 + 已扫场次 ---------- */
 let cfg = { name: '弦月回响', ids: [] };
