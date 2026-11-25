@@ -1,0 +1,51 @@
+# 直播礼物历史回补（lv:all，room=2）—— 2026-11-25 站长「补全部的」
+#
+# 逐场拿 getLiveOne 的回放弹幕（.lrc），解析全部有价礼物写 lv:all。
+# FORCE=1 忽略已扫游标；已扫场次记在 gift:livecur，超时后重跑会从没扫的开始。
+name: 直播礼物历史回补
+
+on:
+  workflow_dispatch:
+    inputs:
+      since:
+        description: '起点（北京），如 2026-01-01T00:00:00+08:00'
+        default: '2026-01-01T00:00:00+08:00'
+      conc:
+        description: '并发（默认 4）'
+        default: '4'
+      pages:
+        description: '翻页数（1 页 20 场；1000 页≈2 万场）'
+        default: '1000'
+      max:
+        description: '本轮最多扫几场'
+        default: '20000'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-history
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: 回补
+        run: node live-gift-sync.mjs
+        env:
+          SITE_URL: ${{ vars.SITE_URL }}
+          INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
+          POCKET48_TOKEN: ${{ secrets.POCKET48_TOKEN }}
+          SCRAPE_PROXY: ${{ secrets.SCRAPE_PROXY }}
+          LG_SINCE: ${{ inputs.since }}
+          ALL: '1'
+          ALL_FORCE: '1'
+          LG_PAGES: ${{ inputs.pages }}
+          LG_MAX: ${{ inputs.max }}
+          LG_CONC: ${{ inputs.conc || '4' }}
