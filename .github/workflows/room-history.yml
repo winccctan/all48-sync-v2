@@ -1,0 +1,53 @@
+# 房间礼物历史回补（lv:all）—— 2026-11-25 站长「直播鸡腿和口袋鸡腿都要补全部的」
+#
+# 逐房间从最新往回翻到 SINCE，把礼物消息写成 lv:all 行（room=1, ch='hist'），
+# worker 端 lvKey 去重，重复跑幂等。
+# 按 uid 取模分片并行（SHARD/SHARDS），避免单 job 跑几小时被 timeout 砍。
+name: 房间礼物历史回补
+
+on:
+  workflow_dispatch:
+    inputs:
+      since:
+        description: '起点（北京），如 2026-01-01T00:00:00+08:00'
+        default: '2026-01-01T00:00:00+08:00'
+      conc:
+        description: '每片并发（默认 4）'
+        default: '4'
+      pages:
+        description: '单房间最大翻页（默认 1500）'
+        default: '1500'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: room-history
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: 回补（分片 ${{ matrix.shard }}/8）
+        run: node backfill-room-history.mjs
+        env:
+          SITE_URL: ${{ vars.SITE_URL }}
+          INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
+          POCKET48_TOKEN: ${{ secrets.POCKET48_TOKEN }}
+          SCRAPE_PROXY: ${{ secrets.SCRAPE_PROXY }}
+          SINCE: ${{ inputs.since }}
+          CONC: ${{ inputs.conc || '4' }}
+          PAGES: ${{ inputs.pages || '1500' }}
+          SHARDS: '8'
+          SHARD: ${{ matrix.shard }}
