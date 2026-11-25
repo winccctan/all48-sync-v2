@@ -211,10 +211,13 @@ async function xoxRows(cyId, src) {
 
 /* ------------------------------------------------- 站点已有记录 */
 // 🔴 用 /api/gift/liveall 一次拉全站（而不是每人一个 /api/gift/detail）：
+  //    🔴 bonus=1：把琴音生花也算进「我们已有」。xox 的 vote = 弦月 + 琴音，
+  //    而 liveall 默认只给 gift:day（弦月）⇒ 不带上琴音就会永远判「缺一份琴音」，
+  //    于是把琴音当成弦月反复回灌（删了下一轮又补回来，2026-11-25 王睿琦/龚晨美）。
 //    191 个成员就是 191 次请求，还各自读一遍当天的 R2 文件，慢且浪费。
 async function fetchAll(src) {
   const from = bjDayOf(SINCE), to = bjDayOf(Date.now());
-  const j = await siteGet(`/api/gift/liveall?from=${from}&to=${to}&src=${src}`);
+  const j = await siteGet(`/api/gift/liveall?from=${from}&to=${to}&src=${src}&bonus=1`);
   // 只留这一路（接口按 src 过滤，这里再筛一次防上游改动）
   const rows = (j.rows || []).filter((r) => Number(r[4]) === src);
   const idx = indexByMid(rows);
