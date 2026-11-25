@@ -2,6 +2,10 @@
 #
 # 逐场拿 getLiveOne 的回放弹幕（.lrc），解析全部有价礼物写 lv:all。
 # FORCE=1 忽略已扫游标；已扫场次记在 gift:livecur，超时后重跑会从没扫的开始。
+#
+# 🔴 2026-11-25：SCRAPE_PROXY 的 home-jp 代理已全部 407 失效 ⇒ 回补改走直连
+#    （Actions 出口直连口袋是通的，实测 4 页 3 秒；本机家宽反而被限流）。
+#    需要代理时再填 secret，这里显式置空覆盖。
 name: 直播礼物历史回补
 
 on:
@@ -9,13 +13,16 @@ on:
     inputs:
       since:
         description: '起点（北京），如 2026-01-01T00:00:00+08:00'
-        default: '2026-01-01T00:00:00+08:00'
+        default: '2026-05-03T00:00:00+08:00'
+      until:
+        description: '终点（北京，不含），留空=不限'
+        default: ''
       conc:
         description: '并发（默认 4）'
         default: '4'
       pages:
-        description: '翻页数（1 页 20 场；1000 页≈2 万场）'
-        default: '1000'
+        description: '翻页数（1 页 20 场；500 页≈1 万场，约够翻到 5 月）'
+        default: '600'
       max:
         description: '本轮最多扫几场'
         default: '20000'
@@ -42,8 +49,9 @@ jobs:
           SITE_URL: ${{ vars.SITE_URL }}
           INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
           POCKET48_TOKEN: ${{ secrets.POCKET48_TOKEN }}
-          SCRAPE_PROXY: ${{ secrets.SCRAPE_PROXY }}
+          SCRAPE_PROXY: ''
           LG_SINCE: ${{ inputs.since }}
+          LG_UNTIL: ${{ inputs.until }}
           ALL: '1'
           ALL_FORCE: '1'
           LG_PAGES: ${{ inputs.pages }}
