@@ -12,10 +12,10 @@ on:
   workflow_dispatch:
     inputs:
       since:
-        description: '起点（北京），如 2026-01-01T00:00:00+08:00'
-        default: '2026-05-03T00:00:00+08:00'
+        description: '起点 YYYY-MM-DD（只接受纯日期，带时间的会变 NaN）'
+        default: '2026-05-03'
       until:
-        description: '终点（北京，不含），留空=不限'
+        description: '终点 YYYY-MM-DD（不含），留空=不限'
         default: ''
       conc:
         description: '并发（默认 4）'
@@ -45,11 +45,11 @@ jobs:
           node-version: '22'
       - name: 回补
         run: node live-gift-sync.mjs
+        # 不用 SCRAPE_PROXY（home-jp 代理全 407）；Actions 直连口袋是通的
         env:
           SITE_URL: ${{ vars.SITE_URL }}
           INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
           POCKET48_TOKEN: ${{ secrets.POCKET48_TOKEN }}
-          SCRAPE_PROXY: ''
           LG_SINCE: ${{ inputs.since }}
           LG_UNTIL: ${{ inputs.until }}
           ALL: '1'
