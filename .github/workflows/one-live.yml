@@ -1,0 +1,37 @@
+# 单成员直播礼物回补（快验）—— 按 userId 拉该成员全部录播，扫 LRC 礼物写 lv:all
+name: 单成员直播回补
+
+on:
+  workflow_dispatch:
+    inputs:
+      mid:
+        description: '成员 uid（口袋 ID）'
+        required: true
+      since:
+        description: '起点 YYYY-MM-DD'
+        default: '2026-05-03'
+      conc:
+        description: '并发'
+        default: '4'
+
+permissions:
+  contents: read
+
+jobs:
+  one:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: 回补
+        run: node backfill-one-live.mjs
+        env:
+          SITE_URL: ${{ vars.SITE_URL }}
+          INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
+          POCKET48_TOKEN: ${{ secrets.POCKET48_TOKEN }}
+          MID: ${{ inputs.mid }}
+          SINCE: ${{ inputs.since }}
+          CONC: ${{ inputs.conc || '4' }}
