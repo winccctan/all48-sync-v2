@@ -238,6 +238,9 @@ const RE_SP = /^\[(\d{1,2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?\]\s*(.+?)\s{2,}送�
 const items = [];
 const allItems = [];              // ALL=1：全部礼物（鸡腿榜用）
 const ALL = process.env.ALL === '1';
+/* 🔴 2026-11-25 增量提交：全量回补 5 万场要跑几小时，原来跑完才一次性推，
+   一旦 350 分钟超时或被 cancel 就全丢。改成每累积 800 条就推一次（worker 按 lvKey 去重，重复推幂等）。*/
+let flushedIdx = 0;
 const OUT = process.env.OUT || '';
 const newLives = {};
 const seenGiftNames = {};
@@ -246,6 +249,23 @@ let scanned = 0, hit = 0, noLrc = 0, unmatched = {}, linesTotal = 0;
 /* 🔴 补历史（2761 场）时串行只有 ~12 场/分钟，要 4 小时。LG_CONC 并行化；
    日常 cron 仍是 1（保持原来行为，避免给口袋48 加压）。 */
 const CONC = Math.max(1, Number(process.env.LG_CONC || 1));
+async function flushPartial() {
+  if (allItems.length - flushedIdx < 800) return;
+  const part = allItems.slice(flushedIdx, flushedIdx + 3000);
+  flushedIdx += part.length;
+  const priced = part.filter((x) => x.mid);
+  if (!priced.length) return;
+  try {
+    const res = await fetch(SITE + '/api/lv/all', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-ingest-token': INGEST },
+      body: JSON.stringify({ ch: 'live', items: priced }),
+    });
+    const out = await res.json().catch(() => ({}));
+    log('[增量] 推 ' + priced.length + ' 条 → ' + JSON.stringify(out.days || out).slice(0, 100));
+  } catch (e) { log('[增量] 失败 ' + String(e.message).slice(0, 80)); }
+}
+
 async function scanOne(lv) {
   let url = '';
   try {
@@ -296,6 +316,7 @@ async function scanOne(lv) {
   }
   scanned++;
   hit += target;
+  if (ALL) await flushPartial();
   // 行数太少说明弹幕还没写完，先不记游标，下一轮重扫
   if (lines.length >= 50) newLives[lv.liveId] = lv.ctime;
   log(`  ${target ? '🎁' : '  '} ${dayStr(lv.ctime)} ${lv.liveId} ${lv.nick} 行 ${lines.length} 礼物 ${got} → 「${cfg.name}」${target}`);
