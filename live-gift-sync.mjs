@@ -147,7 +147,9 @@ async function listLives() {
     for (const x of list) {
       if (!x || !x.liveId) continue;
       const ct = Number(x.ctime || 0);
-      if (ct) oldest = Math.min(oldest, ct);
+      // 🔴 只统计有效 ctime：某条 ctime=0/空 会把 oldest 拉到 0 ⇒ `oldest < SINCE` 立即 break，
+      //    结果只翻到第 1 页（2026-11-25 实测「直播共 20 场」就是这么来的）。
+      if (ct > 0) oldest = Math.min(oldest, ct);
       const dur = durMs(x.duration);
       out.set(String(x.liveId), {
         liveId: String(x.liveId),
