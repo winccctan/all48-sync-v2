@@ -1,4 +1,4 @@
-name: 诊断-回放LRC
+name: 诊断-LRC解析
 on:
   workflow_dispatch:
 permissions:
@@ -13,7 +13,7 @@ jobs:
         with:
           node-version: '22'
       - name: 跑诊断
-        run: node diag-lrc.mjs
+        run: node diag-lrc-parse.mjs
         env:
           POCKET48_TOKEN: ${{ secrets.POCKET48_TOKEN }}
           SCRAPE_PROXY: ${{ secrets.SCRAPE_PROXY }}
