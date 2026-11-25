@@ -1,4 +1,4 @@
-name: 诊断-直播列表
+name: 诊断-回放LRC
 on:
   workflow_dispatch:
 permissions:
@@ -6,14 +6,14 @@ permissions:
 jobs:
   diag:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
       - name: 跑诊断
-        run: node diag-live.mjs
+        run: node diag-lrc.mjs
         env:
           POCKET48_TOKEN: ${{ secrets.POCKET48_TOKEN }}
           SCRAPE_PROXY: ${{ secrets.SCRAPE_PROXY }}
