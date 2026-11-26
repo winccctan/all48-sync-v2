@@ -170,7 +170,12 @@ async function listLives() {
   return [...out.values()].sort((a, b) => b.ctime - a.ctime);
 }
 
-const all = await listLives();
+const allRaw = await listLives();
+/* 🔴 LG_IDS（2026-11-26）：定向重跑指定 liveId（逗号/空白分隔），用于重跑失败的场次。
+   只保留指定场次进后续扫描；不带就保持原行为。站点侧按 lvKey 去重，重跑幂等。 */
+const ONLY_IDS = new Set(String(process.env.LG_IDS || '').split(/[\s,]+/).map((x) => x.trim()).filter(Boolean));
+const all = ONLY_IDS.size ? allRaw.filter((x) => ONLY_IDS.has(String(x.liveId))) : allRaw;
+if (ONLY_IDS.size) log(`[LG_IDS] 定向重跑：命中 ${all.length} / 指定 ${ONLY_IDS.size} / 全部 ${allRaw.length} 场`);
 // ALL_FORCE=1：无视「已扫过」游标，把 SINCE 之后的所有场次重扫一遍
 // （补鸡腿榜历史时用；重扫只会产生相同去重键，站点侧不会重复计分）
 const FORCE = process.env.ALL_FORCE === '1';
@@ -228,8 +233,8 @@ if (FORCE) {
    当天 room=2 只剩 53 条（正常 3000+）、谢晓倩/王语晨/项宇婧 直接归零，就是这个。
    ⇒ 日常取**最新**的 MAX 场（slice(-MAX)），要回填历史用 since 显式指定起点。 */
 if (FORCE) cands = cands.slice().sort((a, b) => a.ctime - b.ctime);
-const todo = FORCE ? cands.slice(-MAX) : cands.slice(0, MAX);
-log(`直播共 ${all.length} 场 | 本轮基集 ${base.length} 场 | ${SINCE_DAY} 之后 ${all.filter((x) => x.ctime >= SINCE).length} 场 | 本轮待扫 ${todo.length} 场`);
+const todo = ONLY_IDS.size ? all : (FORCE ? cands.slice(-MAX) : cands.slice(0, MAX));
+log(`直播共 ${allRaw.length} 场 | 本轮基集 ${base.length} 场 | ${SINCE_DAY} 之后 ${allRaw.filter((x) => x.ctime >= SINCE).length} 场 | 本轮待扫 ${todo.length} 场`);
 
 /* ---------- ④ 逐场抽礼物 ---------- */
 const RE_TAB = /^\[(\d{1,2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?\]\s*(.+?)\t\s*送给\s*(.+?)\s+(\d+)\s*个\s*(.+?)\s*$/;

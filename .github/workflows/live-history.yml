@@ -26,6 +26,9 @@ on:
       max:
         description: '本轮最多扫几场'
         default: '20000'
+      ids:
+        description: '定向重跑指定 liveId（逗号/空白分隔），用于重跑失败场次；留空=全量'
+        default: ''
 
 permissions:
   contents: read
@@ -57,3 +60,4 @@ jobs:
           LG_PAGES: ${{ inputs.pages }}
           LG_MAX: ${{ inputs.max }}
           LG_CONC: ${{ inputs.conc || '4' }}
+          LG_IDS: ${{ inputs.ids }}
